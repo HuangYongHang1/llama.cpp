@@ -1571,6 +1571,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                    string_format("error: unkown value for --flash-attn: '%s'\n", value.c_str()));
                            }
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
+    add_opt(common_arg({ "--qjl-k" }, "[on|off]",
+                       string_format("set TurboQuant/QJL K-cache use ('on' or 'off', default: '%s')",
+                                     params.qjl_k ? "on" : "off"),
+                       [](common_params & params, const std::string & value) {
+                           if (is_truthy(value)) {
+                               params.qjl_k = true;
+                           } else if (is_falsey(value)) {
+                               params.qjl_k = false;
+                           } else {
+                               throw std::runtime_error(
+                                   string_format("error: unknown value for --qjl-k: '%s'\n", value.c_str()));
+                           }
+                       }).set_env("LLAMA_ARG_QJL_K"));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",

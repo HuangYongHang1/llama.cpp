@@ -102,6 +102,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.qjl_k      = params.qjl_k;
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -122,6 +123,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: qjl_k         = %s\n",   __func__, cparams.qjl_k ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
 
@@ -1362,7 +1364,16 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes() const {
-    return std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    const uint32_t base = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+
+    if (!cparams.qjl_k) {
+        return base;
+    }
+
+    // QJL K-cache adds extra rotate/quantize/correction tensors to the decode graph.
+    // The current prototype also builds k_hat from float masks during cache writes,
+    // which materially increases temporary tensor count.
+    return std::max<uint32_t>(8192u, 4u*base);
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
@@ -2278,6 +2289,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.qjl_k                       =*/ false,
     };
 
     return result;

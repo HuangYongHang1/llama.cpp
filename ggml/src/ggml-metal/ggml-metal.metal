@@ -7816,6 +7816,7 @@ template [[host_name("kernel_get_rows_iq4_xs")]]  kernel get_rows_q_t kernel_get
 
 typedef decltype(kernel_set_rows_f<float>) set_rows_f_t;
 
+template [[host_name("kernel_set_rows_i8")]]   kernel set_rows_f_t kernel_set_rows_f<int8_t>;
 template [[host_name("kernel_set_rows_f32")]]  kernel set_rows_f_t kernel_set_rows_f<float>;
 template [[host_name("kernel_set_rows_f16")]]  kernel set_rows_f_t kernel_set_rows_f<half>;
 #if defined(GGML_METAL_USE_BF16)

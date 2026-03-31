@@ -85,6 +85,7 @@ public:
                          bool   v_trans,
                          bool   offload,
                          bool   unified,
+                         bool   qjl_enabled,
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_pad,
@@ -143,6 +144,11 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k_norm(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k_enorm(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k_esign(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_qjl_r(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_qjl_s(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
@@ -193,9 +199,23 @@ private:
 
         ggml_tensor * k;
         ggml_tensor * v;
+        // turboquant
+        ggml_tensor * k_norm;   // [1, n_head_kv, kv_size, n_stream]
+        ggml_tensor * k_enorm;  // [1, n_head_kv, kv_size, n_stream]
+        ggml_tensor * k_esign;  // [m, n_head_kv, kv_size, n_stream]
+        ggml_tensor * qjl_r;    // [d, d]
+        ggml_tensor * qjl_s;    // [d, m]
+        ggml_tensor * qjl_codebook;   // [1, 2^b]
+        ggml_tensor * qjl_boundaries; // [1, 2^b - 1]
+        ggml_tensor * qjl_level_lo;   // [1, 2^b]
+        ggml_tensor * qjl_level_hi;   // [1, 2^b]
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        // turboquant
+        std::vector<ggml_tensor *> k_norm_stream;
+        std::vector<ggml_tensor *> k_enorm_stream;
+        std::vector<ggml_tensor *> k_esign_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -208,6 +228,11 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    // TurboQuant prototype parameters.
+    const bool qjl_enabled = false;
+    const uint32_t qjl_bits = 3;
+    const uint32_t qjl_m = 64;
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
@@ -314,6 +339,11 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_norm(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_enorm(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_esign(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_qjl_r(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_qjl_s(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location

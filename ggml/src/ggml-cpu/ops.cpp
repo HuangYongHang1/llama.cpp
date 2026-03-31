@@ -142,7 +142,13 @@ static void ggml_compute_forward_dup_f16(
                     }
                 }
             } else {
-                GGML_ABORT("fatal error"); // TODO: implement
+                GGML_ABORT("%s: unsupported from_float for dst type %d (%s), src0 type %d (%s), dst name '%s', src name '%s', dst ne=[%lld,%lld,%lld,%lld] src ne=[%lld,%lld,%lld,%lld]",
+                        __func__,
+                        dst->type, ggml_type_name(dst->type),
+                        src0->type, ggml_type_name(src0->type),
+                        dst->name, src0->name,
+                        (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                        (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3]); // TODO: implement
             }
         } else {
             //printf("%s: this is not optimal - fix me\n", __func__);
@@ -184,7 +190,13 @@ static void ggml_compute_forward_dup_f16(
                     }
                 }
             } else {
-                GGML_ABORT("fatal error"); // TODO: implement
+                GGML_ABORT("%s: unsupported from_float for dst type %d (%s), src0 type %d (%s), dst name '%s', src name '%s', dst ne=[%lld,%lld,%lld,%lld] src ne=[%lld,%lld,%lld,%lld]",
+                        __func__,
+                        dst->type, ggml_type_name(dst->type),
+                        src0->type, ggml_type_name(src0->type),
+                        dst->name, src0->name,
+                        (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                        (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3]); // TODO: implement
             }
         }
         return;
@@ -423,7 +435,13 @@ static void ggml_compute_forward_dup_bf16(
                     }
                 }
             } else {
-                GGML_ABORT("fatal error"); // TODO: implement
+                GGML_ABORT("%s: unsupported from_float for dst type %d (%s), src0 type %d (%s), dst name '%s', src name '%s', dst ne=[%lld,%lld,%lld,%lld] src ne=[%lld,%lld,%lld,%lld]",
+                        __func__,
+                        dst->type, ggml_type_name(dst->type),
+                        src0->type, ggml_type_name(src0->type),
+                        dst->name, src0->name,
+                        (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                        (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3]); // TODO: implement
             }
         } else {
             //printf("%s: this is not optimal - fix me\n", __func__);
@@ -483,7 +501,13 @@ static void ggml_compute_forward_dup_bf16(
                     }
                 }
             } else {
-                GGML_ABORT("fatal error"); // TODO: implement
+                GGML_ABORT("%s: unsupported from_float for dst type %d (%s), src0 type %d (%s), dst name '%s', src name '%s', dst ne=[%lld,%lld,%lld,%lld] src ne=[%lld,%lld,%lld,%lld]",
+                        __func__,
+                        dst->type, ggml_type_name(dst->type),
+                        src0->type, ggml_type_name(src0->type),
+                        dst->name, src0->name,
+                        (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                        (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3]); // TODO: implement
             }
         }
         return;
@@ -717,7 +741,14 @@ static void ggml_compute_forward_dup_f32(
                     }
                 }
             } else {
-                GGML_ABORT("fatal error"); // TODO: implement
+                GGML_ABORT("%s: unsupported non-f32/f16 dst type %d (%s), src0 type %d (%s), dst name '%s', src name '%s', dst ne=[%lld,%lld,%lld,%lld] src ne=[%lld,%lld,%lld,%lld] nb00=%zu",
+                        __func__,
+                        dst->type, ggml_type_name(dst->type),
+                        src0->type, ggml_type_name(src0->type),
+                        dst->name, src0->name,
+                        (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                        (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+                        (size_t) nb00); // TODO: implement
             }
         } else {
             //printf("%s: this is not optimal - fix me\n", __func__);

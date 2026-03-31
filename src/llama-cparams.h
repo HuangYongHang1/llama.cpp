@@ -33,6 +33,7 @@ struct llama_cparams {
     bool warmup;
     bool op_offload;
     bool kv_unified;
+    bool qjl_k;
 
     enum llama_pooling_type pooling_type;
 

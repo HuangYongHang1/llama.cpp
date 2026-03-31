@@ -255,6 +255,7 @@ struct cmd_params {
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<bool>                flash_attn;
+    std::vector<bool>                qjl_k;
     std::vector<std::vector<float>>  tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
     std::vector<bool>                use_mmap;
@@ -291,6 +292,7 @@ static const cmd_params cmd_params_defaults = {
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { false },
+    /* qjl_k                */ { false },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
     /* use_mmap             */ { true },
@@ -365,6 +367,8 @@ static void print_usage(int /* argc */, char ** argv) {
            join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <0|1>                   (default: %s)\n",
            join(cmd_params_defaults.flash_attn, ",").c_str());
+    printf("  --qjl-k <0|1>                             (default: %s)\n",
+           join(cmd_params_defaults.qjl_k, ",").c_str());
     printf("  -mmp, --mmap <0|1>                        (default: %s)\n",
            join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  -embd, --embeddings <0|1>                 (default: %s)\n",
@@ -632,6 +636,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.flash_attn.insert(params.flash_attn.end(), p.begin(), p.end());
+            } else if (arg == "--qjl-k") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.qjl_k.insert(params.qjl_k.end(), p.begin(), p.end());
             } else if (arg == "-mmp" || arg == "--mmap") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -856,6 +867,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.flash_attn.empty()) {
         params.flash_attn = cmd_params_defaults.flash_attn;
     }
+    if (params.qjl_k.empty()) {
+        params.qjl_k = cmd_params_defaults.qjl_k;
+    }
     if (params.tensor_split.empty()) {
         params.tensor_split = cmd_params_defaults.tensor_split;
     }
@@ -906,6 +920,7 @@ struct cmd_params_instance {
     int                main_gpu;
     bool               no_kv_offload;
     bool               flash_attn;
+    bool               qjl_k;
     std::vector<float> tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool               use_mmap;
@@ -994,6 +1009,7 @@ struct cmd_params_instance {
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cparams.qjl_k           = qjl_k;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
@@ -1023,6 +1039,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & fa : params.flash_attn)
+    for (const auto & qjl : params.qjl_k)
     for (const auto & nt : params.n_threads)
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
@@ -1051,6 +1068,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .qjl_k        = */ qjl,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
@@ -1083,6 +1101,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .qjl_k        = */ qjl,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
@@ -1115,6 +1134,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu     = */ mg,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
+                /* .qjl_k        = */ qjl,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
                 /* .use_mmap     = */ mmp,
@@ -1151,6 +1171,7 @@ struct test {
     int                      main_gpu;
     bool                     no_kv_offload;
     bool                     flash_attn;
+    bool                     qjl_k;
     std::vector<float>       tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     bool                     use_mmap;
@@ -1185,6 +1206,7 @@ struct test {
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
+        qjl_k          = inst.qjl_k;
         tensor_split   = inst.tensor_split;
         tensor_buft_overrides = inst.tensor_buft_overrides;
         use_mmap       = inst.use_mmap;
@@ -1235,7 +1257,7 @@ struct test {
             "model_type",   "model_size",   "model_n_params", "n_batch",    "n_ubatch",     "n_threads",
             "cpu_mask",     "cpu_strict",   "poll",           "type_k",     "type_v",       "n_gpu_layers",
             "split_mode",   "main_gpu",     "no_kv_offload",  "flash_attn", "tensor_split", "tensor_buft_overrides",
-            "use_mmap",     "embeddings",   "no_op_offload",   "n_prompt",       "n_gen",      "n_depth",      "test_time",
+            "qjl_k",        "use_mmap",     "embeddings",   "no_op_offload",   "n_prompt",       "n_gen",      "n_depth",      "test_time",
             "avg_ns",       "stddev_ns",    "avg_ts",         "stddev_ts",
         };
         return fields;
@@ -1250,7 +1272,7 @@ struct test {
             field == "avg_ns" || field == "stddev_ns" || field == "no_op_offload") {
             return INT;
         }
-        if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
+        if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" || field == "qjl_k" ||
             field == "use_mmap" || field == "embeddings") {
             return BOOL;
         }
@@ -1319,6 +1341,7 @@ struct test {
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
                                             std::to_string(flash_attn),
+                                            std::to_string(qjl_k),
                                             tensor_split_str,
                                             tensor_buft_overrides_str,
                                             std::to_string(use_mmap),
@@ -1500,6 +1523,9 @@ struct markdown_printer : public printer {
         if (field == "flash_attn") {
             return 2;
         }
+        if (field == "qjl_k") {
+            return 3;
+        }
         if (field == "use_mmap") {
             return 4;
         }
@@ -1533,6 +1559,9 @@ struct markdown_printer : public printer {
         }
         if (field == "flash_attn") {
             return "fa";
+        }
+        if (field == "qjl_k") {
+            return "qjl";
         }
         if (field == "use_mmap") {
             return "mmap";
@@ -1598,6 +1627,9 @@ struct markdown_printer : public printer {
         }
         if (params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
             fields.emplace_back("flash_attn");
+        }
+        if (params.qjl_k.size() > 1 || params.qjl_k != cmd_params_defaults.qjl_k) {
+            fields.emplace_back("qjl_k");
         }
         if (params.tensor_split.size() > 1 || params.tensor_split != cmd_params_defaults.tensor_split) {
             fields.emplace_back("tensor_split");
