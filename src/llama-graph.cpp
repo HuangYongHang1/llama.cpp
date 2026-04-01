@@ -1595,7 +1595,6 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_norm = mctx_cur->get_k_norm(ctx0, il);
         ggml_tensor * codebook = mctx_cur->get_qjl_codebook(ctx0, il);
         ggml_tensor * q_rot = build_qjl_rotated_q(ctx0, q_cur, qjl_r);
-
         kq_main = build_qjl_score_main(ctx0, q_rot, k, k_norm, codebook);
 
         if (qjl_corr_enabled) {
@@ -1719,7 +1718,6 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * k_norm = mctx_cur->get_k_norm(ctx0, il);
         ggml_tensor * codebook = mctx_cur->get_qjl_codebook(ctx0, il);
         ggml_tensor * q_rot = build_qjl_rotated_q(ctx0, q_cur, qjl_r);
-
         kq_main = build_qjl_score_main(ctx0, q_rot, k, k_norm, codebook);
 
         if (qjl_corr_enabled) {

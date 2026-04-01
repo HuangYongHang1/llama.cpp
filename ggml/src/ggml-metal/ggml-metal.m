@@ -254,6 +254,7 @@ enum ggml_metal_kernel_type {
     GGML_METAL_KERNEL_TYPE_GET_ROWS_IQ4_XS,
     GGML_METAL_KERNEL_TYPE_GET_ROWS_I32,
     GGML_METAL_KERNEL_TYPE_QJL_SCORE_MAIN,
+    GGML_METAL_KERNEL_TYPE_QJL_SCORE_MAIN_D128_B3,
     GGML_METAL_KERNEL_TYPE_SET_ROWS_I8,
     GGML_METAL_KERNEL_TYPE_SET_ROWS_F32,
     GGML_METAL_KERNEL_TYPE_SET_ROWS_F16,
@@ -1288,6 +1289,7 @@ static struct ggml_backend_metal_context * ggml_metal_init(ggml_backend_dev_t de
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_GET_ROWS_IQ4_XS,                 get_rows_iq4_xs,                 true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_GET_ROWS_I32,                    get_rows_i32,                    true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_QJL_SCORE_MAIN,                  qjl_score_main,                  true);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_QJL_SCORE_MAIN_D128_B3,          qjl_score_main_d128_b3,         true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SET_ROWS_I8,                     set_rows_i8,                     true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SET_ROWS_F32,                    set_rows_f32,                    true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SET_ROWS_F16,                    set_rows_f16,                    true);
@@ -4344,7 +4346,12 @@ static int ggml_metal_encode_node(
                 size_t offs_src3 = 0;
                 id<MTLBuffer> id_src3 = src3 ? ggml_metal_get_buffer(src3, &offs_src3) : nil;
 
-                id<MTLComputePipelineState> pipeline = ctx->kernels[GGML_METAL_KERNEL_TYPE_QJL_SCORE_MAIN].pipeline;
+                const bool use_qjl_fast_d128_b3 = ne00 == 128 && ggml_get_op_params_i32(dst, 0) == 3;
+
+                id<MTLComputePipelineState> pipeline = ctx->kernels[
+                        use_qjl_fast_d128_b3
+                        ? GGML_METAL_KERNEL_TYPE_QJL_SCORE_MAIN_D128_B3
+                        : GGML_METAL_KERNEL_TYPE_QJL_SCORE_MAIN].pipeline;
 
                 ggml_metal_kargs_qjl_score_main args = {
                     /*.d_head   =*/ (int32_t) ne00,
@@ -4352,6 +4359,7 @@ static int ggml_metal_encode_node(
                     /*.n_levels =*/ (int32_t) (src3 ? src3->ne[1] : 0),
                     /*.n_head_q =*/ (int32_t) ne2,
                     /*.n_head_kv=*/ (int32_t) ne12,
+                    /*.n_kv     =*/ (int32_t) ne0,
                     /*.q_nb0    =*/ nb00,
                     /*.q_nb1    =*/ nb01,
                     /*.q_nb2    =*/ nb02,
@@ -4377,7 +4385,7 @@ static int ggml_metal_encode_node(
                 [encoder setBuffer:id_src3 offset:offs_src3 atIndex:4];
                 [encoder setBuffer:id_dst  offset:offs_dst  atIndex:5];
 
-                [encoder dispatchThreadgroups:MTLSizeMake(ne0, ne1, ne2*ne3)
+                [encoder dispatchThreadgroups:MTLSizeMake((ne0 + 4 - 1)/4, ne1, ne2*ne3)
                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             } break;
         case GGML_OP_SET_ROWS:

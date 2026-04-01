@@ -575,6 +575,7 @@ typedef struct {
     int32_t  n_levels;
     int32_t  n_head_q;
     int32_t  n_head_kv;
+    int32_t  n_kv;
     uint64_t q_nb0;
     uint64_t q_nb1;
     uint64_t q_nb2;

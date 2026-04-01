@@ -7375,6 +7375,136 @@ static inline uchar qjl_get_packed_level(device const uchar * src, uint i, uint 
     return uchar((word >> shift) & ((1u << bits) - 1u));
 }
 
+#define QJL_SCORE_TILE_KV 4u
+#define QJL_QBUF_MAX 512u
+
+kernel void kernel_qjl_score_main_d128_b3(
+        constant ggml_metal_kargs_qjl_score_main & args,
+        device const float * q_rot,
+        device const uchar * k_packed,
+        device const float * k_norm,
+        device const float * codebook,
+        device       float * dst,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        ushort               tiisg[[thread_index_in_simdgroup]]) {
+    const uint kv0 = tgpig.x*QJL_SCORE_TILE_KV;
+    const uint t  = tgpig.y;
+    const uint hs = tgpig.z;
+
+    const uint n_head_q  = uint(args.n_head_q);
+    const uint n_head_kv = uint(args.n_head_kv);
+    const uint n_gqa     = max(1u, n_head_q / n_head_kv);
+
+    const uint hq = hs % n_head_q;
+    const uint s  = hs / n_head_q;
+    const uint hk = min(hq / n_gqa, n_head_kv - 1u);
+    const uint lane = uint(tiisg);
+    const uint packed_bytes = (128u*3u + 7u) >> 3;
+
+    const device char * q_base = (const device char *) q_rot
+            + uint64_t(t)*args.q_nb1
+            + uint64_t(hq)*args.q_nb2
+            + uint64_t(s)*args.q_nb3;
+
+    threadgroup float q_shared[128];
+    threadgroup float k_shared[QJL_SCORE_TILE_KV*128u];
+
+    for (uint d = lane; d < 128u; d += N_SIMDWIDTH) {
+        q_shared[d] = *(const device float *) (q_base + uint64_t(d)*args.q_nb0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint d0 = lane*4u;
+
+    float code_lut[8];
+    for (uint i = 0; i < 8u; ++i) {
+        code_lut[i] = *(const device float *) ((const device char *) codebook + uint64_t(i)*args.c_nb1);
+    }
+
+    #pragma unroll
+    for (uint ikv = 0; ikv < QJL_SCORE_TILE_KV; ++ikv) {
+        const uint kv = kv0 + ikv;
+        if (kv >= uint(args.n_kv)) {
+            if (d0 < 128u) {
+                k_shared[ikv*128u + d0 + 0u] = 0.0f;
+                k_shared[ikv*128u + d0 + 1u] = 0.0f;
+                k_shared[ikv*128u + d0 + 2u] = 0.0f;
+                k_shared[ikv*128u + d0 + 3u] = 0.0f;
+            }
+            continue;
+        }
+
+        if (d0 < 128u) {
+            const device uchar * k_row = (const device uchar *) ((const device char *) k_packed
+                    + uint64_t(kv)*args.k_nb1
+                    + uint64_t(hk)*args.k_nb2
+                    + uint64_t(s)*args.k_nb3);
+
+            const uint bit = d0*3u;
+            const uint bo = bit >> 3;
+            const uint shift = bit & 7u;
+
+            uint bits = 0u;
+            if (bo + 0u < packed_bytes) bits |= uint(k_row[bo + 0u]);
+            if (bo + 1u < packed_bytes) bits |= uint(k_row[bo + 1u]) << 8;
+            if (bo + 2u < packed_bytes) bits |= uint(k_row[bo + 2u]) << 16;
+
+            bits >>= shift;
+
+            k_shared[ikv*128u + d0 + 0u] = code_lut[(bits >> 0u) & 0x7u];
+            k_shared[ikv*128u + d0 + 1u] = code_lut[(bits >> 3u) & 0x7u];
+            k_shared[ikv*128u + d0 + 2u] = code_lut[(bits >> 6u) & 0x7u];
+            k_shared[ikv*128u + d0 + 3u] = code_lut[(bits >> 9u) & 0x7u];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float partial[QJL_SCORE_TILE_KV] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    if (d0 < 128u) {
+        const float q0 = q_shared[d0 + 0u];
+        const float q1 = q_shared[d0 + 1u];
+        const float q2 = q_shared[d0 + 2u];
+        const float q3 = q_shared[d0 + 3u];
+
+        #pragma unroll
+        for (uint ikv = 0; ikv < QJL_SCORE_TILE_KV; ++ikv) {
+            partial[ikv] = q0*k_shared[ikv*128u + d0 + 0u]
+                         + q1*k_shared[ikv*128u + d0 + 1u]
+                         + q2*k_shared[ikv*128u + d0 + 2u]
+                         + q3*k_shared[ikv*128u + d0 + 3u];
+        }
+    }
+
+    float dots[QJL_SCORE_TILE_KV];
+    #pragma unroll
+    for (uint ikv = 0; ikv < QJL_SCORE_TILE_KV; ++ikv) {
+        dots[ikv] = simd_sum(partial[ikv]);
+    }
+
+    if (tiisg == 0) {
+        #pragma unroll
+        for (uint ikv = 0; ikv < QJL_SCORE_TILE_KV; ++ikv) {
+            const uint kv = kv0 + ikv;
+            if (kv >= uint(args.n_kv)) {
+                continue;
+            }
+
+            const float r = *(const device float *) ((const device char *) k_norm
+                    + uint64_t(kv)*args.r_nb1
+                    + uint64_t(hk)*args.r_nb2
+                    + uint64_t(s)*args.r_nb3);
+
+            *(device float *) ((device char *) dst
+                    + uint64_t(kv)*args.d_nb0
+                    + uint64_t(t)*args.d_nb1
+                    + uint64_t(hq)*args.d_nb2
+                    + uint64_t(s)*args.d_nb3) = r*dots[ikv];
+        }
+    }
+}
+
 kernel void kernel_qjl_score_main(
         constant ggml_metal_kargs_qjl_score_main & args,
         device const float * q_rot,
@@ -7384,7 +7514,7 @@ kernel void kernel_qjl_score_main(
         device       float * dst,
         uint3                tgpig[[threadgroup_position_in_grid]],
         ushort               tiisg[[thread_index_in_simdgroup]]) {
-    const uint kv = tgpig.x;
+    const uint kv0 = tgpig.x*QJL_SCORE_TILE_KV;
     const uint t  = tgpig.y;
     const uint hs = tgpig.z;
 
@@ -7401,31 +7531,70 @@ kernel void kernel_qjl_score_main(
             + uint64_t(hq)*args.q_nb2
             + uint64_t(s)*args.q_nb3;
 
-    const device uchar * k_row = (const device uchar *) ((const device char *) k_packed
-            + uint64_t(kv)*args.k_nb1
-            + uint64_t(hk)*args.k_nb2
-            + uint64_t(s)*args.k_nb3);
+    threadgroup float q_shared[QJL_QBUF_MAX];
 
-    const float r = *(const device float *) ((const device char *) k_norm
-            + uint64_t(kv)*args.r_nb1
-            + uint64_t(hk)*args.r_nb2
-            + uint64_t(s)*args.r_nb3);
-
-    float partial = 0.0f;
-    for (uint d = tiisg; d < uint(args.d_head); d += N_SIMDWIDTH) {
-        const float qv = *(const device float *) (q_base + uint64_t(d)*args.q_nb0);
-        const uint level = qjl_get_packed_level(k_row, d, uint(args.qjl_bits));
-        const float centroid = *(const device float *) ((const device char *) codebook + uint64_t(level)*args.c_nb1);
-        partial += qv*centroid;
+    const bool use_q_shared = uint(args.d_head) <= QJL_QBUF_MAX;
+    if (use_q_shared) {
+        for (uint d = tiisg; d < uint(args.d_head); d += N_SIMDWIDTH) {
+            q_shared[d] = *(const device float *) (q_base + uint64_t(d)*args.q_nb0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    const float dot = simd_sum(partial);
+    float code_lut[8];
+    for (uint i = 0; i < min(uint(args.n_levels), 8u); ++i) {
+        code_lut[i] = *(const device float *) ((const device char *) codebook + uint64_t(i)*args.c_nb1);
+    }
+
+    float partial[QJL_SCORE_TILE_KV] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    for (uint d = tiisg; d < uint(args.d_head); d += N_SIMDWIDTH) {
+        const float qv = use_q_shared
+                ? q_shared[d]
+                : *(const device float *) (q_base + uint64_t(d)*args.q_nb0);
+
+        #pragma unroll
+        for (uint ikv = 0; ikv < QJL_SCORE_TILE_KV; ++ikv) {
+            const uint kv = kv0 + ikv;
+            if (kv >= uint(args.n_kv)) {
+                continue;
+            }
+
+            const device uchar * k_row = (const device uchar *) ((const device char *) k_packed
+                    + uint64_t(kv)*args.k_nb1
+                    + uint64_t(hk)*args.k_nb2
+                    + uint64_t(s)*args.k_nb3);
+
+            const uint level = qjl_get_packed_level(k_row, d, uint(args.qjl_bits));
+            partial[ikv] += qv*code_lut[level];
+        }
+    }
+
+    float dots[QJL_SCORE_TILE_KV];
+    #pragma unroll
+    for (uint ikv = 0; ikv < QJL_SCORE_TILE_KV; ++ikv) {
+        dots[ikv] = simd_sum(partial[ikv]);
+    }
+
     if (tiisg == 0) {
-        *(device float *) ((device char *) dst
-                + uint64_t(kv)*args.d_nb0
-                + uint64_t(t)*args.d_nb1
-                + uint64_t(hq)*args.d_nb2
-                + uint64_t(s)*args.d_nb3) = r*dot;
+        #pragma unroll
+        for (uint ikv = 0; ikv < QJL_SCORE_TILE_KV; ++ikv) {
+            const uint kv = kv0 + ikv;
+            if (kv >= uint(args.n_kv)) {
+                continue;
+            }
+
+            const float r = *(const device float *) ((const device char *) k_norm
+                    + uint64_t(kv)*args.r_nb1
+                    + uint64_t(hk)*args.r_nb2
+                    + uint64_t(s)*args.r_nb3);
+
+            *(device float *) ((device char *) dst
+                    + uint64_t(kv)*args.d_nb0
+                    + uint64_t(t)*args.d_nb1
+                    + uint64_t(hq)*args.d_nb2
+                    + uint64_t(s)*args.d_nb3) = r*dots[ikv];
+        }
     }
 }
 
