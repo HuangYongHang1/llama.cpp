@@ -963,6 +963,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GET_ROWS",
     "GET_ROWS_BACK",
     "SET_ROWS",
+    "QJL_SCORE_MAIN",
     "DIAG",
     "DIAG_MASK_INF",
     "DIAG_MASK_ZERO",
@@ -1019,7 +1020,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1067,6 +1068,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "get_rows(x)",
     "get_rows_back(x)",
     "set_rows(x)",
+    "qjl_score_main(q,k,r,c)",
     "diag(x)",
     "diag_mask_inf(x)",
     "diag_mask_zero(x)",
@@ -1123,7 +1125,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3657,6 +3659,41 @@ struct ggml_tensor * ggml_get_rows_back(
     result->op     = GGML_OP_GET_ROWS_BACK;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_qjl_score_main(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q_rot,
+        struct ggml_tensor  * k_packed,
+        struct ggml_tensor  * k_norm,
+        struct ggml_tensor  * codebook) {
+    GGML_ASSERT(q_rot->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_packed->type == GGML_TYPE_I8);
+    GGML_ASSERT(k_norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(codebook->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(q_rot->ne[3] == k_packed->ne[3]);
+    GGML_ASSERT(q_rot->ne[2] % k_packed->ne[2] == 0);
+    GGML_ASSERT(k_norm->ne[0] == 1);
+    GGML_ASSERT(k_norm->ne[1] == k_packed->ne[1]);
+    GGML_ASSERT(k_norm->ne[2] == k_packed->ne[2]);
+    GGML_ASSERT(k_norm->ne[3] == k_packed->ne[3]);
+
+    GGML_ASSERT(codebook->ne[0] == 1);
+    GGML_ASSERT(codebook->ne[1] == 8);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+            k_packed->ne[1], q_rot->ne[1], q_rot->ne[2], q_rot->ne[3]);
+
+    result->op     = GGML_OP_QJL_SCORE_MAIN;
+    result->src[0] = q_rot;
+    result->src[1] = k_packed;
+    result->src[2] = k_norm;
+    result->src[3] = codebook;
+
+    ggml_set_op_params_i32(result, 0, 3);
 
     return result;
 }
@@ -6250,6 +6287,9 @@ static void ggml_compute_backward(
                 // noop
             }
         } break;
+        case GGML_OP_QJL_SCORE_MAIN: {
+            // no backward pass implemented
+        } break;
         case GGML_OP_DIAG_MASK_INF: {
             if (src0_needs_grads) {
                 /* ggml_diag_mask_inf_impl() shouldn't be here */
@@ -6538,6 +6578,11 @@ void ggml_build_backward_expand(
             case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
             case GGML_OP_ROPE:          // positions not differentiable
                 ignore_src[1] = true;
+                break;
+            case GGML_OP_QJL_SCORE_MAIN:
+                ignore_src[1] = true;
+                ignore_src[2] = true;
+                ignore_src[3] = true;
                 break;
 
             default:

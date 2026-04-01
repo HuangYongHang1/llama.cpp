@@ -500,6 +500,7 @@ extern "C" {
         GGML_OP_GET_ROWS,
         GGML_OP_GET_ROWS_BACK,
         GGML_OP_SET_ROWS,
+        GGML_OP_QJL_SCORE_MAIN,
         GGML_OP_DIAG,
         GGML_OP_DIAG_MASK_INF,
         GGML_OP_DIAG_MASK_ZERO,
@@ -1539,6 +1540,13 @@ extern "C" {
             struct ggml_tensor  * a,  // gradients of ggml_get_rows result
             struct ggml_tensor  * b,  // row indices
             struct ggml_tensor  * c); // data for ggml_get_rows, only used for its shape
+
+    GGML_API struct ggml_tensor * ggml_qjl_score_main(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q_rot,
+            struct ggml_tensor  * k_packed,
+            struct ggml_tensor  * k_norm,
+            struct ggml_tensor  * codebook);
 
     // a TD  [n_embd, ne1,    ne2,    ne3]
     // b TS  [n_embd, n_rows, ne02,   ne03] | ne02 == ne2, ne03 == ne3

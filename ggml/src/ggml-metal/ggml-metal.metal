@@ -7362,6 +7362,73 @@ kernel void kernel_get_rows_i32(
     }
 }
 
+static inline uchar qjl_get_packed_level(device const uchar * src, uint i, uint bits) {
+    const uint bit = bits*i;
+    const uint byte = bit >> 3;
+    const uint shift = bit & 7u;
+
+    ushort word = ushort(src[byte]);
+    if (shift + bits > 8u) {
+        word |= ushort(src[byte + 1]) << 8;
+    }
+
+    return uchar((word >> shift) & ((1u << bits) - 1u));
+}
+
+kernel void kernel_qjl_score_main(
+        constant ggml_metal_kargs_qjl_score_main & args,
+        device const float * q_rot,
+        device const uchar * k_packed,
+        device const float * k_norm,
+        device const float * codebook,
+        device       float * dst,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        ushort               tiisg[[thread_index_in_simdgroup]]) {
+    const uint kv = tgpig.x;
+    const uint t  = tgpig.y;
+    const uint hs = tgpig.z;
+
+    const uint n_head_q  = uint(args.n_head_q);
+    const uint n_head_kv = uint(args.n_head_kv);
+    const uint n_gqa     = max(1u, n_head_q / n_head_kv);
+
+    const uint hq = hs % n_head_q;
+    const uint s  = hs / n_head_q;
+    const uint hk = min(hq / n_gqa, n_head_kv - 1u);
+
+    const device char * q_base = (const device char *) q_rot
+            + uint64_t(t)*args.q_nb1
+            + uint64_t(hq)*args.q_nb2
+            + uint64_t(s)*args.q_nb3;
+
+    const device uchar * k_row = (const device uchar *) ((const device char *) k_packed
+            + uint64_t(kv)*args.k_nb1
+            + uint64_t(hk)*args.k_nb2
+            + uint64_t(s)*args.k_nb3);
+
+    const float r = *(const device float *) ((const device char *) k_norm
+            + uint64_t(kv)*args.r_nb1
+            + uint64_t(hk)*args.r_nb2
+            + uint64_t(s)*args.r_nb3);
+
+    float partial = 0.0f;
+    for (uint d = tiisg; d < uint(args.d_head); d += N_SIMDWIDTH) {
+        const float qv = *(const device float *) (q_base + uint64_t(d)*args.q_nb0);
+        const uint level = qjl_get_packed_level(k_row, d, uint(args.qjl_bits));
+        const float centroid = *(const device float *) ((const device char *) codebook + uint64_t(level)*args.c_nb1);
+        partial += qv*centroid;
+    }
+
+    const float dot = simd_sum(partial);
+    if (tiisg == 0) {
+        *(device float *) ((device char *) dst
+                + uint64_t(kv)*args.d_nb0
+                + uint64_t(t)*args.d_nb1
+                + uint64_t(hq)*args.d_nb2
+                + uint64_t(s)*args.d_nb3) = r*dot;
+    }
+}
+
 template<typename block_q, void (*quantize_func)(device const float *, device block_q &)>
 kernel void kernel_set_rows_q32(
         constant ggml_metal_kargs_set_rows & args,

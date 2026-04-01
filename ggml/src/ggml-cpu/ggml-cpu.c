@@ -1824,6 +1824,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_get_rows(params, tensor);
             } break;
+        case GGML_OP_QJL_SCORE_MAIN:
+            {
+                ggml_compute_forward_qjl_score_main(params, tensor);
+            } break;
         case GGML_OP_GET_ROWS_BACK:
             {
                 ggml_compute_forward_get_rows_back(params, tensor);
@@ -2228,6 +2232,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 // decreases performance with GPU offloading
                 //n_tasks = n_threads;
                 n_tasks = 1;
+            } break;
+        case GGML_OP_QJL_SCORE_MAIN:
+            {
+                n_tasks = n_threads;
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:

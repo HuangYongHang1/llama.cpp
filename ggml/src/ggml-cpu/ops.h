@@ -56,6 +56,7 @@ void ggml_compute_forward_view(const struct ggml_compute_params * params, struct
 void ggml_compute_forward_permute(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_transpose(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_get_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_qjl_score_main(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_get_rows_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_set_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_diag(const struct ggml_compute_params * params, struct ggml_tensor * dst);

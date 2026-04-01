@@ -1268,76 +1268,6 @@ static ggml_tensor * build_qjl_rotated_q(
     return ggml_reshape_3d(ctx, q_rot_2d, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]);
 }
 
-static inline uint8_t qjl_get_3bit(const uint8_t * src, size_t i) {
-    const size_t bit = 3*i;
-    const size_t byte = bit >> 3;
-    const int shift = bit & 7;
-
-    uint16_t word = src[byte];
-    if (shift > 5) {
-        word |= uint16_t(src[byte + 1]) << 8;
-    }
-
-    return uint8_t((word >> shift) & 0x7u);
-}
-
-static void ggml_qjl_score_main_op(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
-    GGML_UNUSED(userdata);
-
-    const ggml_tensor * q_rot_perm = dst->src[0];
-    const ggml_tensor * k_packed   = dst->src[1];
-    const ggml_tensor * k_norm     = dst->src[2];
-    const ggml_tensor * codebook   = dst->src[3];
-
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(q_rot_perm->type == GGML_TYPE_F32);
-    GGML_ASSERT(k_packed->type == GGML_TYPE_I8);
-    GGML_ASSERT(k_norm->type == GGML_TYPE_F32);
-    GGML_ASSERT(codebook->type == GGML_TYPE_F32);
-
-    const int64_t d_head   = q_rot_perm->ne[0];
-    const int64_t n_tokens = q_rot_perm->ne[1];
-    const int64_t n_head   = q_rot_perm->ne[2];
-    const int64_t n_stream = q_rot_perm->ne[3];
-    const int64_t n_kv     = k_packed->ne[1];
-    const int64_t packed_bytes_per_head = k_packed->ne[0];
-    const int64_t n_levels = codebook->ne[1];
-
-    GGML_ASSERT(dst->ne[0] == n_kv);
-    GGML_ASSERT(dst->ne[1] == n_tokens);
-    GGML_ASSERT(dst->ne[2] == n_head);
-    GGML_ASSERT(dst->ne[3] == n_stream);
-
-    const int64_t total_q = n_tokens*n_head*n_stream;
-    const int64_t dr = (total_q + nth - 1)/nth;
-    const int64_t ir0 = dr*ith;
-    const int64_t ir1 = std::min(ir0 + dr, total_q);
-
-    for (int64_t iq = ir0; iq < ir1; ++iq) {
-        const int64_t t = iq % n_tokens;
-        const int64_t h = (iq / n_tokens) % n_head;
-        const int64_t s = iq / (n_tokens*n_head);
-
-        const char * q_base = (const char *) q_rot_perm->data + t*q_rot_perm->nb[1] + h*q_rot_perm->nb[2] + s*q_rot_perm->nb[3];
-
-        for (int64_t kv = 0; kv < n_kv; ++kv) {
-            const uint8_t * k_row = (const uint8_t *) ((const char *) k_packed->data + kv*k_packed->nb[1] + h*k_packed->nb[2] + s*k_packed->nb[3]);
-            const float r = *(const float *) ((const char *) k_norm->data + kv*k_norm->nb[1] + h*k_norm->nb[2] + s*k_norm->nb[3]);
-
-            float dot = 0.0f;
-            for (int64_t d = 0; d < d_head; ++d) {
-                const float qv = *(const float *) (q_base + d*q_rot_perm->nb[0]);
-                const uint8_t level = qjl_get_3bit(k_row, (size_t) d);
-                GGML_ASSERT(level < n_levels);
-                const float centroid = *(const float *) ((const char *) codebook->data + level*codebook->nb[1]);
-                dot += qv*centroid;
-            }
-
-            *(float *) ((char *) dst->data + kv*dst->nb[0] + t*dst->nb[1] + h*dst->nb[2] + s*dst->nb[3]) = r*dot;
-        }
-    }
-}
-
 static ggml_tensor * build_qjl_score_main(
         ggml_context * ctx,
         ggml_tensor * q_rot,
@@ -1356,8 +1286,7 @@ static ggml_tensor * build_qjl_score_main(
     }
     ggml_tensor * k_norm_main = ggml_permute(ctx, k_norm, 0, 2, 1, 3);
 
-    ggml_tensor * args[] = { q_main, k_main, k_norm_main, codebook };
-    return ggml_custom_4d(ctx, GGML_TYPE_F32, k_main->ne[1], q_main->ne[1], q_main->ne[2], q_main->ne[3], args, 4, ggml_qjl_score_main_op, GGML_N_TASKS_MAX, nullptr);
+    return ggml_qjl_score_main(ctx, q_main, k_main, k_norm_main, codebook);
 }
 }
 

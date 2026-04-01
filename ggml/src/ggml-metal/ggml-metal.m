@@ -253,6 +253,7 @@ enum ggml_metal_kernel_type {
     GGML_METAL_KERNEL_TYPE_GET_ROWS_IQ4_NL,
     GGML_METAL_KERNEL_TYPE_GET_ROWS_IQ4_XS,
     GGML_METAL_KERNEL_TYPE_GET_ROWS_I32,
+    GGML_METAL_KERNEL_TYPE_QJL_SCORE_MAIN,
     GGML_METAL_KERNEL_TYPE_SET_ROWS_I8,
     GGML_METAL_KERNEL_TYPE_SET_ROWS_F32,
     GGML_METAL_KERNEL_TYPE_SET_ROWS_F16,
@@ -1286,6 +1287,7 @@ static struct ggml_backend_metal_context * ggml_metal_init(ggml_backend_dev_t de
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_GET_ROWS_IQ4_NL,                 get_rows_iq4_nl,                 true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_GET_ROWS_IQ4_XS,                 get_rows_iq4_xs,                 true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_GET_ROWS_I32,                    get_rows_i32,                    true);
+        GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_QJL_SCORE_MAIN,                  qjl_score_main,                  true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SET_ROWS_I8,                     set_rows_i8,                     true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SET_ROWS_F32,                    set_rows_f32,                    true);
         GGML_METAL_ADD_KERNEL(GGML_METAL_KERNEL_TYPE_SET_ROWS_F16,                    set_rows_f16,                    true);
@@ -2018,6 +2020,17 @@ static bool ggml_metal_supports_op(const struct ggml_backend_metal_device_contex
                     default:
                         return false;
                 };
+            }
+        case GGML_OP_QJL_SCORE_MAIN:
+            {
+                return op->src[0] &&
+                       op->src[1] &&
+                       op->src[2] &&
+                       op->src[3] &&
+                       op->src[0]->type == GGML_TYPE_F32 &&
+                       op->src[1]->type == GGML_TYPE_I8 &&
+                       op->src[2]->type == GGML_TYPE_F32 &&
+                       op->src[3]->type == GGML_TYPE_F32;
             }
         default:
             return false;
@@ -4323,6 +4336,49 @@ static int ggml_metal_encode_node(
                 [encoder setBuffer:id_dst  offset:offs_dst     atIndex:3];
 
                 [encoder dispatchThreadgroups:MTLSizeMake(ne10, ne11, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            } break;
+        case GGML_OP_QJL_SCORE_MAIN:
+            {
+                struct ggml_tensor * src3 = dst->src[3];
+
+                size_t offs_src3 = 0;
+                id<MTLBuffer> id_src3 = src3 ? ggml_metal_get_buffer(src3, &offs_src3) : nil;
+
+                id<MTLComputePipelineState> pipeline = ctx->kernels[GGML_METAL_KERNEL_TYPE_QJL_SCORE_MAIN].pipeline;
+
+                ggml_metal_kargs_qjl_score_main args = {
+                    /*.d_head   =*/ (int32_t) ne00,
+                    /*.qjl_bits =*/ ggml_get_op_params_i32(dst, 0),
+                    /*.n_levels =*/ (int32_t) (src3 ? src3->ne[1] : 0),
+                    /*.n_head_q =*/ (int32_t) ne2,
+                    /*.n_head_kv=*/ (int32_t) ne12,
+                    /*.q_nb0    =*/ nb00,
+                    /*.q_nb1    =*/ nb01,
+                    /*.q_nb2    =*/ nb02,
+                    /*.q_nb3    =*/ nb03,
+                    /*.k_nb1    =*/ nb11,
+                    /*.k_nb2    =*/ nb12,
+                    /*.k_nb3    =*/ nb13,
+                    /*.r_nb1    =*/ nb21,
+                    /*.r_nb2    =*/ nb22,
+                    /*.r_nb3    =*/ nb23,
+                    /*.c_nb1    =*/ src3 ? src3->nb[1] : 0,
+                    /*.d_nb0    =*/ nb0,
+                    /*.d_nb1    =*/ nb1,
+                    /*.d_nb2    =*/ nb2,
+                    /*.d_nb3    =*/ nb3,
+                };
+
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBytes:&args length:sizeof(args) atIndex:0];
+                [encoder setBuffer:id_src0 offset:offs_src0 atIndex:1];
+                [encoder setBuffer:id_src1 offset:offs_src1 atIndex:2];
+                [encoder setBuffer:id_src2 offset:offs_src2 atIndex:3];
+                [encoder setBuffer:id_src3 offset:offs_src3 atIndex:4];
+                [encoder setBuffer:id_dst  offset:offs_dst  atIndex:5];
+
+                [encoder dispatchThreadgroups:MTLSizeMake(ne0, ne1, ne2*ne3)
+                       threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             } break;
         case GGML_OP_SET_ROWS:
             {

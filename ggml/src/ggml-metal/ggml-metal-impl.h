@@ -570,6 +570,29 @@ typedef struct {
 } ggml_metal_kargs_get_rows;
 
 typedef struct {
+    int32_t  d_head;
+    int32_t  qjl_bits;
+    int32_t  n_levels;
+    int32_t  n_head_q;
+    int32_t  n_head_kv;
+    uint64_t q_nb0;
+    uint64_t q_nb1;
+    uint64_t q_nb2;
+    uint64_t q_nb3;
+    uint64_t k_nb1;
+    uint64_t k_nb2;
+    uint64_t k_nb3;
+    uint64_t r_nb1;
+    uint64_t r_nb2;
+    uint64_t r_nb3;
+    uint64_t c_nb1;
+    uint64_t d_nb0;
+    uint64_t d_nb1;
+    uint64_t d_nb2;
+    uint64_t d_nb3;
+} ggml_metal_kargs_qjl_score_main;
+
+typedef struct {
     int32_t  nk0;
     int32_t  ne01;
     uint64_t nb01;
