@@ -7286,8 +7286,15 @@ kernel void kernel_get_rows_q(
         uint3                tptg [[threads_per_threadgroup]]) {
     const int64_t i10 = tgpig.x;
     const int64_t i11 = tgpig.y;
+    constexpr int32_t ggml_type_f16 = 1;
+    constexpr int32_t ggml_type_i8 = 24;
 
-    const int64_t r = ((const device int32_t *) ((const device char *) src1 + i11*args.nb11 + i10*args.nb10))[0];
+    const device char * idx_ptr = (const device char *) src1 + i11*args.nb11 + i10*args.nb10;
+    const int64_t r = args.src1_type == ggml_type_i8
+            ? ((const device int8_t  *) idx_ptr)[0]
+            : args.src1_type == ggml_type_f16
+                ? (int64_t) rint((float) ((const device half *) idx_ptr)[0])
+                : ((const device int32_t *) idx_ptr)[0];
 
     const int64_t i02 = i11;
 
@@ -7309,8 +7316,15 @@ kernel void kernel_get_rows_f(
         uint3                tptg [[threads_per_threadgroup]]) {
     const int64_t i10 = tgpig.x;
     const int64_t i11 = tgpig.y;
+    constexpr int32_t ggml_type_f16 = 1;
+    constexpr int32_t ggml_type_i8 = 24;
 
-    const int64_t r = ((const device int32_t *) ((const device char *) src1 + i11*args.nb11 + i10*args.nb10))[0];
+    const device char * idx_ptr = (const device char *) src1 + i11*args.nb11 + i10*args.nb10;
+    const int64_t r = args.src1_type == ggml_type_i8
+            ? ((const device int8_t  *) idx_ptr)[0]
+            : args.src1_type == ggml_type_f16
+                ? (int64_t) rint((float) ((const device half *) idx_ptr)[0])
+                : ((const device int32_t *) idx_ptr)[0];
 
     const int64_t i02 = i11;
 
@@ -7330,8 +7344,15 @@ kernel void kernel_get_rows_i32(
         uint3                tptg [[threads_per_threadgroup]]) {
     const int64_t i10 = tgpig.x;
     const int64_t i11 = tgpig.y;
+    constexpr int32_t ggml_type_f16 = 1;
+    constexpr int32_t ggml_type_i8 = 24;
 
-    const int64_t r = ((const device int32_t *) ((const device char *) src1 + i11*args.nb11 + i10*args.nb10))[0];
+    const device char * idx_ptr = (const device char *) src1 + i11*args.nb11 + i10*args.nb10;
+    const int64_t r = args.src1_type == ggml_type_i8
+            ? ((const device int8_t  *) idx_ptr)[0]
+            : args.src1_type == ggml_type_f16
+                ? (int64_t) rint((float) ((const device half *) idx_ptr)[0])
+                : ((const device int32_t *) idx_ptr)[0];
 
     const int64_t i02 = i11;
 

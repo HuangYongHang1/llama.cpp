@@ -3624,7 +3624,7 @@ struct ggml_tensor * ggml_get_rows(
         struct ggml_tensor  * b) {
     GGML_ASSERT(a->ne[2] == b->ne[1]);
     GGML_ASSERT(b->ne[3] == 1);
-    GGML_ASSERT(b->type == GGML_TYPE_I32);
+    GGML_ASSERT(b->type == GGML_TYPE_I32 || b->type == GGML_TYPE_I8 || b->type == GGML_TYPE_F16);
 
     // TODO: implement non F32 return
     enum ggml_type type = GGML_TYPE_F32;

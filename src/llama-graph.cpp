@@ -1258,6 +1258,109 @@ ggml_tensor * llm_graph_context::build_pos_bias(ggml_tensor * pos_bucket, ggml_t
     return pos_bias;
 }
 
+namespace {
+static ggml_tensor * build_qjl_rotated_q(
+        ggml_context * ctx,
+        ggml_tensor * q_cur,
+        ggml_tensor * qjl_r) {
+    ggml_tensor * q_2d = ggml_reshape_2d(ctx, q_cur, q_cur->ne[0], q_cur->ne[1]*q_cur->ne[2]);
+    ggml_tensor * q_rot_2d = ggml_mul_mat(ctx, qjl_r, q_2d);
+    return ggml_reshape_3d(ctx, q_rot_2d, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]);
+}
+
+static inline uint8_t qjl_get_3bit(const uint8_t * src, size_t i) {
+    const size_t bit = 3*i;
+    const size_t byte = bit >> 3;
+    const int shift = bit & 7;
+
+    uint16_t word = src[byte];
+    if (shift > 5) {
+        word |= uint16_t(src[byte + 1]) << 8;
+    }
+
+    return uint8_t((word >> shift) & 0x7u);
+}
+
+static void ggml_qjl_score_main_op(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+
+    const ggml_tensor * q_rot_perm = dst->src[0];
+    const ggml_tensor * k_packed   = dst->src[1];
+    const ggml_tensor * k_norm     = dst->src[2];
+    const ggml_tensor * codebook   = dst->src[3];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_rot_perm->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_packed->type == GGML_TYPE_I8);
+    GGML_ASSERT(k_norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(codebook->type == GGML_TYPE_F32);
+
+    const int64_t d_head   = q_rot_perm->ne[0];
+    const int64_t n_tokens = q_rot_perm->ne[1];
+    const int64_t n_head   = q_rot_perm->ne[2];
+    const int64_t n_stream = q_rot_perm->ne[3];
+    const int64_t n_kv     = k_packed->ne[1];
+    const int64_t packed_bytes_per_head = k_packed->ne[0];
+    const int64_t n_levels = codebook->ne[1];
+
+    GGML_ASSERT(dst->ne[0] == n_kv);
+    GGML_ASSERT(dst->ne[1] == n_tokens);
+    GGML_ASSERT(dst->ne[2] == n_head);
+    GGML_ASSERT(dst->ne[3] == n_stream);
+
+    const int64_t total_q = n_tokens*n_head*n_stream;
+    const int64_t dr = (total_q + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = std::min(ir0 + dr, total_q);
+
+    for (int64_t iq = ir0; iq < ir1; ++iq) {
+        const int64_t t = iq % n_tokens;
+        const int64_t h = (iq / n_tokens) % n_head;
+        const int64_t s = iq / (n_tokens*n_head);
+
+        const char * q_base = (const char *) q_rot_perm->data + t*q_rot_perm->nb[1] + h*q_rot_perm->nb[2] + s*q_rot_perm->nb[3];
+
+        for (int64_t kv = 0; kv < n_kv; ++kv) {
+            const uint8_t * k_row = (const uint8_t *) ((const char *) k_packed->data + kv*k_packed->nb[1] + h*k_packed->nb[2] + s*k_packed->nb[3]);
+            const float r = *(const float *) ((const char *) k_norm->data + kv*k_norm->nb[1] + h*k_norm->nb[2] + s*k_norm->nb[3]);
+
+            float dot = 0.0f;
+            for (int64_t d = 0; d < d_head; ++d) {
+                const float qv = *(const float *) (q_base + d*q_rot_perm->nb[0]);
+                const uint8_t level = qjl_get_3bit(k_row, (size_t) d);
+                GGML_ASSERT(level < n_levels);
+                const float centroid = *(const float *) ((const char *) codebook->data + level*codebook->nb[1]);
+                dot += qv*centroid;
+            }
+
+            *(float *) ((char *) dst->data + kv*dst->nb[0] + t*dst->nb[1] + h*dst->nb[2] + s*dst->nb[3]) = r*dot;
+        }
+    }
+}
+
+static ggml_tensor * build_qjl_score_main(
+        ggml_context * ctx,
+        ggml_tensor * q_rot,
+        ggml_tensor * k_packed,
+        ggml_tensor * k_norm,
+        ggml_tensor * codebook) {
+    const auto n_stream = k_packed->ne[3];
+
+    ggml_tensor * q_main = ggml_reshape_4d(ctx, q_rot, q_rot->ne[0], q_rot->ne[1], q_rot->ne[2]/n_stream, n_stream);
+    q_main = ggml_permute(ctx, q_main, 0, 2, 1, 3);
+
+    ggml_tensor * k_main = ggml_permute(ctx, k_packed, 0, 2, 1, 3);
+
+    if (k_norm->type != GGML_TYPE_F32) {
+        k_norm = ggml_cast(ctx, k_norm, GGML_TYPE_F32);
+    }
+    ggml_tensor * k_norm_main = ggml_permute(ctx, k_norm, 0, 2, 1, 3);
+
+    ggml_tensor * args[] = { q_main, k_main, k_norm_main, codebook };
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, k_main->ne[1], q_main->ne[1], q_main->ne[2], q_main->ne[3], args, 4, ggml_qjl_score_main_op, GGML_N_TASKS_MAX, nullptr);
+}
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * q,
          ggml_tensor * k,
@@ -1268,24 +1371,25 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
                float   kq_scale,
                  int   il,
-         ggml_tensor * kq_corr) const {
+         ggml_tensor * kq_corr,
+         ggml_tensor * kq_main) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
-    const auto n_stream = k->ne[3];
+    const auto n_stream = kq_main ? kq_main->ne[3] : k->ne[3];
 
     q = ggml_reshape_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream);
 
-    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
-    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
-
-    const auto n_kv = k->ne[1];
+    const auto n_kv = kq_main ? kq_main->ne[0] : k->ne[2];
 
     ggml_tensor * cur;
 
     // TODO: replace hardcoded padding with ggml-provided padding
-    if (cparams.flash_attn && (n_kv % 256 == 0) && kq_b == nullptr) {
+    if (!kq_main && cparams.flash_attn && (n_kv % 256 == 0) && kq_b == nullptr) {
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
         if (v_trans) {
@@ -1327,12 +1431,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
-        cb(kq, "kq", il);
+        ggml_tensor * kq;
+        if (kq_main) {
+            kq = kq_main;
+            cb(kq, "kq_qjl_main", il);
+        } else {
+            q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+            k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+            kq = ggml_mul_mat(ctx0, k, q);
+            cb(kq, "kq", il);
 
-        // note: this op tends to require high floating point range
-        //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+            // note: this op tends to require high floating point range
+            //       while for some models F16 is enough, for others it is not, so we default to F32 here
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        }
 
         if (kq_corr) {
             if (kq_corr->type != kq->type) {
@@ -1538,34 +1650,24 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
     ggml_tensor * kq_corr = nullptr;
 
-    // TurboQuant prototype: the cache stores the quantized rotated key direction (k_hat).
-    // Rebuild the main attention term by rotating q with the same R and rescaling k_hat by norm_k.
+    // TurboQuant scheme 1:
+    // store the quantized main term back in the original basis during KV write,
+    // so the main attention path remains the ordinary q @ k^T. Only the QJL
+    // correction uses the rotated query.
+    ggml_tensor * kq_main = nullptr;
+
     if (cparams.qjl_k) {
         static const bool qjl_corr_enabled = []() {
             const char * env = std::getenv("LLAMA_QJL_CORR");
-            return env == nullptr || std::atoi(env) != 0;
+            return env != nullptr && std::atoi(env) != 0;
         }();
 
         ggml_tensor * qjl_r = mctx_cur->get_qjl_r(ctx0, il);
         ggml_tensor * k_norm = mctx_cur->get_k_norm(ctx0, il);
+        ggml_tensor * codebook = mctx_cur->get_qjl_codebook(ctx0, il);
+        ggml_tensor * q_rot = build_qjl_rotated_q(ctx0, q_cur, qjl_r);
 
-        ggml_tensor * q_2d = ggml_reshape_2d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1]*q_cur->ne[2]);
-        ggml_tensor * q_rot_2d = ggml_mul_mat(ctx0, qjl_r, q_2d);
-        q = ggml_reshape_3d(ctx0, q_rot_2d, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]);
-
-        if (!ggml_can_repeat(k_norm, k)) {
-            LLAMA_LOG_ERROR("%s: qjl k_norm repeat mismatch at layer %d: k_norm=[%lld,%lld,%lld,%lld] k=[%lld,%lld,%lld,%lld]\n",
-                    __func__, il,
-                    (long long) k_norm->ne[0], (long long) k_norm->ne[1], (long long) k_norm->ne[2], (long long) k_norm->ne[3],
-                    (long long) k->ne[0],      (long long) k->ne[1],      (long long) k->ne[2],      (long long) k->ne[3]);
-            GGML_ABORT("invalid qjl k_norm repeat");
-        }
-        ggml_tensor * k_norm_rep = ggml_repeat(ctx0, k_norm, k);
-        if (k_norm_rep->type != k->type) {
-            k_norm_rep = ggml_cast(ctx0, k_norm_rep, k->type);
-        }
-
-        k = ggml_mul(ctx0, k, k_norm_rep);
+        kq_main = build_qjl_score_main(ctx0, q_rot, k, k_norm, codebook);
 
         if (qjl_corr_enabled) {
             ggml_tensor * qjl_s = mctx_cur->get_qjl_s(ctx0, il);
@@ -1574,7 +1676,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
             const auto n_stream = k->ne[3];
 
-            ggml_tensor * q_corr = ggml_reshape_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream);
+            ggml_tensor * q_corr = ggml_reshape_4d(ctx0, q_rot, q_rot->ne[0], q_rot->ne[1], q_rot->ne[2]/n_stream, n_stream);
             q_corr = ggml_permute(ctx0, q_corr, 0, 2, 1, 3);
 
             ggml_tensor * sq = ggml_mul_mat(ctx0, qjl_s, q_corr);
@@ -1608,7 +1710,7 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, kq_corr);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, kq_corr, kq_main);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -1676,32 +1778,20 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
     ggml_tensor * kq_corr = nullptr;
 
+    ggml_tensor * kq_main = nullptr;
+
     if (cparams.qjl_k) {
         static const bool qjl_corr_enabled = []() {
             const char * env = std::getenv("LLAMA_QJL_CORR");
-            return env == nullptr || std::atoi(env) != 0;
+            return env != nullptr && std::atoi(env) != 0;
         }();
 
         ggml_tensor * qjl_r = mctx_cur->get_qjl_r(ctx0, il);
         ggml_tensor * k_norm = mctx_cur->get_k_norm(ctx0, il);
+        ggml_tensor * codebook = mctx_cur->get_qjl_codebook(ctx0, il);
+        ggml_tensor * q_rot = build_qjl_rotated_q(ctx0, q_cur, qjl_r);
 
-        ggml_tensor * q_2d = ggml_reshape_2d(ctx0, q_cur, q_cur->ne[0], q_cur->ne[1]*q_cur->ne[2]);
-        ggml_tensor * q_rot_2d = ggml_mul_mat(ctx0, qjl_r, q_2d);
-        q = ggml_reshape_3d(ctx0, q_rot_2d, q_cur->ne[0], q_cur->ne[1], q_cur->ne[2]);
-
-        if (!ggml_can_repeat(k_norm, k)) {
-            LLAMA_LOG_ERROR("%s: qjl iswa k_norm repeat mismatch at layer %d: k_norm=[%lld,%lld,%lld,%lld] k=[%lld,%lld,%lld,%lld]\n",
-                    __func__, il,
-                    (long long) k_norm->ne[0], (long long) k_norm->ne[1], (long long) k_norm->ne[2], (long long) k_norm->ne[3],
-                    (long long) k->ne[0],      (long long) k->ne[1],      (long long) k->ne[2],      (long long) k->ne[3]);
-            GGML_ABORT("invalid qjl iswa k_norm repeat");
-        }
-        ggml_tensor * k_norm_rep = ggml_repeat(ctx0, k_norm, k);
-        if (k_norm_rep->type != k->type) {
-            k_norm_rep = ggml_cast(ctx0, k_norm_rep, k->type);
-        }
-
-        k = ggml_mul(ctx0, k, k_norm_rep);
+        kq_main = build_qjl_score_main(ctx0, q_rot, k, k_norm, codebook);
 
         if (qjl_corr_enabled) {
             ggml_tensor * qjl_s = mctx_cur->get_qjl_s(ctx0, il);
@@ -1710,7 +1800,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
             const auto n_stream = k->ne[3];
 
-            ggml_tensor * q_corr = ggml_reshape_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream);
+            ggml_tensor * q_corr = ggml_reshape_4d(ctx0, q_rot, q_rot->ne[0], q_rot->ne[1], q_rot->ne[2]/n_stream, n_stream);
             q_corr = ggml_permute(ctx0, q_corr, 0, 2, 1, 3);
 
             ggml_tensor * sq = ggml_mul_mat(ctx0, qjl_s, q_corr);
@@ -1744,7 +1834,7 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, kq_corr);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, kq_corr, kq_main);
     cb(cur, "kqv_out", il);
 
     if (wo) {

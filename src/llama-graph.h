@@ -697,7 +697,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il,
-            ggml_tensor * kq_corr = nullptr) const;
+            ggml_tensor * kq_corr = nullptr,
+            ggml_tensor * kq_main = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

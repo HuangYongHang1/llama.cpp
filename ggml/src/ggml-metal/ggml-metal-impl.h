@@ -566,6 +566,7 @@ typedef struct {
     uint64_t nb11;
     uint64_t nb1;
     uint64_t nb2;
+    int32_t  src1_type;
 } ggml_metal_kargs_get_rows;
 
 typedef struct {

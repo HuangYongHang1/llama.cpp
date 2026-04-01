@@ -188,6 +188,86 @@ static void turboquant_unpack_3bit(const uint8_t * src, size_t n, int8_t * dst) 
     }
 }
 
+static inline uint8_t turboquant_get_3bit(const uint8_t * src, size_t i) {
+    const size_t bit = 3*i;
+    const size_t byte = bit >> 3;
+    const int shift = bit & 7;
+
+    uint16_t word = src[byte];
+    if (shift > 5) {
+        word |= uint16_t(src[byte + 1]) << 8;
+    }
+
+    return uint8_t((word >> shift) & 0x7u);
+}
+
+static inline void turboquant_set_3bit(uint8_t * dst, size_t i, uint8_t v) {
+    const size_t bit = 3*i;
+    const size_t byte = bit >> 3;
+    const int shift = bit & 7;
+
+    const uint16_t mask = uint16_t(0x7u) << shift;
+    uint16_t word = dst[byte];
+    if (shift > 5) {
+        word |= uint16_t(dst[byte + 1]) << 8;
+    }
+    word = (word & ~mask) | ((uint16_t(v & 0x7u) << shift) & mask);
+
+    dst[byte] = uint8_t(word & 0xffu);
+    if (shift > 5) {
+        dst[byte + 1] = uint8_t(word >> 8);
+    }
+}
+
+static void turboquant_custom_pack_qjl_k(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+
+    const ggml_tensor * k_unit        = dst->src[1];
+    const ggml_tensor * k_idxs        = dst->src[2];
+    const ggml_tensor * qjl_boundaries = dst->src[3];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I8);
+    GGML_ASSERT(k_unit->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_idxs->type == GGML_TYPE_I64);
+    GGML_ASSERT(qjl_boundaries->type == GGML_TYPE_F32);
+
+    const int64_t d_head   = k_unit->ne[0];
+    const int64_t n_head   = k_unit->ne[1];
+    const int64_t n_tokens = k_unit->ne[2];
+
+    const int64_t packed_bytes_per_head = dst->ne[0] / n_head;
+    const int64_t n_levels = qjl_boundaries->ne[1] + 1;
+
+    GGML_ASSERT(packed_bytes_per_head == (int64_t) turboquant_pack_3bit_size((size_t) d_head));
+
+    const int64_t dr = (n_tokens + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = std::min(ir0 + dr, n_tokens);
+
+    const float * boundaries = (const float *) qjl_boundaries->data;
+
+    for (int64_t t = ir0; t < ir1; ++t) {
+        const int64_t cache_row = *(const int64_t *) ((const char *) k_idxs->data + t*k_idxs->nb[0]);
+        uint8_t * dst_row = (uint8_t *) ((char *) dst->data + cache_row*dst->nb[1]);
+
+        for (int64_t h = 0; h < n_head; ++h) {
+            uint8_t * dst_head = dst_row + h*packed_bytes_per_head;
+            memset(dst_head, 0, (size_t) packed_bytes_per_head);
+
+            for (int64_t d = 0; d < d_head; ++d) {
+                const float v = *(const float *) ((const char *) k_unit->data + d*k_unit->nb[0] + h*k_unit->nb[1] + t*k_unit->nb[2]);
+
+                uint8_t level = 0;
+                while (level + 1 < n_levels && v > boundaries[level]) {
+                    ++level;
+                }
+
+                turboquant_set_3bit(dst_head, (size_t) d, level);
+            }
+        }
+    }
+}
+
 static void turboquant_pack_sign_1bit(const int8_t * src, size_t n, std::vector<uint8_t> & dst) {
     dst.assign(turboquant_pack_1bit_size(n), 0);
 
@@ -228,6 +308,11 @@ llama_kv_cache::llama_kv_cache(
     model(model), hparams(model.hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), qjl_enabled(qjl_enabled), swa_type(swa_type) {
 
+    qjl_corr_enabled = []() {
+        const char * env = std::getenv("LLAMA_QJL_CORR");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
@@ -238,7 +323,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             const size_t tensors_per_layer = qjl_enabled
-                    ? size_t(16u*(1u + n_stream))
+                    ? size_t((qjl_corr_enabled ? 16u : 13u)*(1u + n_stream))
                     : size_t(2u*(1u + n_stream));
             ggml_init_params params = {
                 /*.mem_size   =*/ tensors_per_layer*n_layer_kv*ggml_tensor_overhead(),
@@ -345,7 +430,10 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * qjl_level_lo;
         ggml_tensor * qjl_level_hi;
 
-        k       = ggml_new_tensor_3d(ctx, qjl_enabled ? GGML_TYPE_F16 : type_k, n_embd_k_gqa, kv_size, n_stream);
+        const uint32_t n_qjl_k_bytes_head = (uint32_t) turboquant_pack_3bit_size(hparams.n_embd_head_k);
+        const uint32_t n_k_store_gqa = qjl_enabled ? n_qjl_k_bytes_head*hparams.n_head_kv(il) : n_embd_k_gqa;
+
+        k       = ggml_new_tensor_3d(ctx, qjl_enabled ? GGML_TYPE_I8 : type_k, n_k_store_gqa, kv_size, n_stream);
         v       = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
         k_norm  = nullptr;
         k_enorm = nullptr;
@@ -359,10 +447,14 @@ llama_kv_cache::llama_kv_cache(
 
         if (qjl_enabled) {
             k_norm  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1,     hparams.n_head_kv(il), kv_size, n_stream);
-            k_enorm = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1,     hparams.n_head_kv(il), kv_size, n_stream);
-            k_esign = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, qjl_m, hparams.n_head_kv(il), kv_size, n_stream);
+            if (qjl_corr_enabled) {
+                k_enorm = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1,     hparams.n_head_kv(il), kv_size, n_stream);
+                k_esign = ggml_new_tensor_4d(ctx, GGML_TYPE_I8, qjl_m, hparams.n_head_kv(il), kv_size, n_stream);
+            }
             qjl_r          = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.n_embd_head_k, hparams.n_embd_head_k);
-            qjl_s          = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.n_embd_head_k, qjl_m);
+            if (qjl_corr_enabled) {
+                qjl_s      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.n_embd_head_k, qjl_m);
+            }
             qjl_codebook   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, qjl_levels);
             qjl_boundaries = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, qjl_levels - 1);
             qjl_level_lo   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, qjl_levels);
@@ -373,10 +465,16 @@ llama_kv_cache::llama_kv_cache(
         ggml_format_name(v, "cache_v_l%d", il);
         if (qjl_enabled) {
             ggml_format_name(k_norm,  "cache_k_norm_l%d",  il);
-            ggml_format_name(k_enorm, "cache_k_enorm_l%d", il);
-            ggml_format_name(k_esign, "cache_k_esign_l%d", il);
+            if (k_enorm) {
+                ggml_format_name(k_enorm, "cache_k_enorm_l%d", il);
+            }
+            if (k_esign) {
+                ggml_format_name(k_esign, "cache_k_esign_l%d", il);
+            }
             ggml_format_name(qjl_r,          "cache_qjl_r_l%d",          il);
-            ggml_format_name(qjl_s,          "cache_qjl_s_l%d",          il);
+            if (qjl_s) {
+                ggml_format_name(qjl_s,      "cache_qjl_s_l%d",          il);
+            }
             ggml_format_name(qjl_codebook,   "cache_qjl_codebook_l%d",   il);
             ggml_format_name(qjl_boundaries, "cache_qjl_boundaries_l%d", il);
             ggml_format_name(qjl_level_lo,   "cache_qjl_level_lo_l%d",   il);
@@ -390,12 +488,16 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> k_esign_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]));
+            k_stream.push_back(ggml_view_2d(ctx, k, n_k_store_gqa, kv_size, k->nb[1], s*k->nb[2]));
             v_stream.push_back(ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]));
             if (qjl_enabled) {
                 k_norm_stream.push_back (ggml_view_3d(ctx, k_norm,  1,     hparams.n_head_kv(il), kv_size, k_norm->nb[1],  k_norm->nb[2],  s*k_norm->nb[3]));
-                k_enorm_stream.push_back(ggml_view_3d(ctx, k_enorm, 1,     hparams.n_head_kv(il), kv_size, k_enorm->nb[1], k_enorm->nb[2], s*k_enorm->nb[3]));
-                k_esign_stream.push_back(ggml_view_3d(ctx, k_esign, qjl_m, hparams.n_head_kv(il), kv_size, k_esign->nb[1], k_esign->nb[2], s*k_esign->nb[3]));
+                if (k_enorm) {
+                    k_enorm_stream.push_back(ggml_view_3d(ctx, k_enorm, 1,     hparams.n_head_kv(il), kv_size, k_enorm->nb[1], k_enorm->nb[2], s*k_enorm->nb[3]));
+                }
+                if (k_esign) {
+                    k_esign_stream.push_back(ggml_view_3d(ctx, k_esign, qjl_m, hparams.n_head_kv(il), kv_size, k_esign->nb[1], k_esign->nb[2], s*k_esign->nb[3]));
+                }
             }
         }
 
@@ -465,7 +567,9 @@ llama_kv_cache::llama_kv_cache(
     for (auto & layer : layers) {
         if (qjl_enabled) {
             ggml_backend_tensor_set(layer.qjl_r, qjl_r_host.data(), 0, qjl_r_host.size()*sizeof(float));
-            ggml_backend_tensor_set(layer.qjl_s, qjl_s_host.data(), 0, qjl_s_host.size()*sizeof(float));
+            if (layer.qjl_s) {
+                ggml_backend_tensor_set(layer.qjl_s, qjl_s_host.data(), 0, qjl_s_host.size()*sizeof(float));
+            }
             ggml_backend_tensor_set(layer.qjl_codebook, qjl_codebook_host.data(), 0, qjl_codebook_host.size()*sizeof(float));
             ggml_backend_tensor_set(layer.qjl_boundaries, qjl_boundaries_host.data(), 0, qjl_boundaries_host.size()*sizeof(float));
             ggml_backend_tensor_set(layer.qjl_level_lo, qjl_level_lo_host.data(), 0, qjl_level_lo_host.size()*sizeof(float));
@@ -476,10 +580,11 @@ llama_kv_cache::llama_kv_cache(
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
+        const char * k_type_name = layers.empty() ? ggml_type_name(type_k) : ggml_type_name(layers.front().k->type);
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
-                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
+                k_type_name, (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
@@ -906,8 +1011,12 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
                 if (qjl_enabled) {
                     ggml_backend_tensor_copy(layer.k_norm_stream [ssrc], layer.k_norm_stream [sdst]);
-                    ggml_backend_tensor_copy(layer.k_enorm_stream[ssrc], layer.k_enorm_stream[sdst]);
-                    ggml_backend_tensor_copy(layer.k_esign_stream[ssrc], layer.k_esign_stream[sdst]);
+                    if (!layer.k_enorm_stream.empty()) {
+                        ggml_backend_tensor_copy(layer.k_enorm_stream[ssrc], layer.k_enorm_stream[sdst]);
+                    }
+                    if (!layer.k_esign_stream.empty()) {
+                        ggml_backend_tensor_copy(layer.k_esign_stream[ssrc], layer.k_esign_stream[sdst]);
+                    }
                 }
             }
         }
@@ -1259,18 +1368,32 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
     const uint64_t kv_size      = get_size();
-    const uint64_t n_embd_k_gqa = k->ne[0];
-
-    assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+    const uint64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+    const uint64_t n_head_kv    = hparams.n_head_kv(il);
+    const uint64_t n_k_store_gqa = k->ne[0];
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
+    if (qjl_enabled) {
+        const uint64_t n_qjl_k_bytes_head = turboquant_pack_3bit_size(hparams.n_embd_head_k);
+        GGML_ASSERT(n_k_store_gqa == n_qjl_k_bytes_head*n_head_kv);
+
+        return ggml_view_4d(ctx, k,
+                n_qjl_k_bytes_head, n_head_kv, n_kv, ns,
+                ggml_row_size(k->type, n_qjl_k_bytes_head),
+                ggml_row_size(k->type, n_k_store_gqa),
+                ggml_row_size(k->type, n_k_store_gqa*kv_size),
+                ggml_row_size(k->type, n_k_store_gqa*kv_size)*sinfo.s0);
+    }
+
+    GGML_ASSERT(n_k_store_gqa == n_embd_k_gqa);
+
     ggml_tensor * k_view = ggml_view_4d(ctx, k,
-            hparams.n_embd_head_k, hparams.n_head_kv(il), n_kv, ns,
+            hparams.n_embd_head_k, n_head_kv, n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k),
-            ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_k_store_gqa),
+            ggml_row_size(k->type, n_k_store_gqa*kv_size),
+            ggml_row_size(k->type, n_k_store_gqa*kv_size)*sinfo.s0);
 
     return k_view;
 }
@@ -1294,6 +1417,7 @@ ggml_tensor * llama_kv_cache::get_k_enorm(ggml_context * ctx, int32_t il, uint32
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k_enorm = layers[ikv].k_enorm;
+    GGML_ASSERT(k_enorm != nullptr);
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
@@ -1309,6 +1433,7 @@ ggml_tensor * llama_kv_cache::get_k_esign(ggml_context * ctx, int32_t il, uint32
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k_esign = layers[ikv].k_esign;
+    GGML_ASSERT(k_esign != nullptr);
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
 
@@ -1329,7 +1454,14 @@ ggml_tensor * llama_kv_cache::get_qjl_r(ggml_context * ctx, int32_t il) const {
 ggml_tensor * llama_kv_cache::get_qjl_s(ggml_context * ctx, int32_t il) const {
     const int32_t ikv = map_layer_ids.at(il);
 
+    GGML_ASSERT(layers[ikv].qjl_s != nullptr);
     return ggml_view_tensor(ctx, layers[ikv].qjl_s);
+}
+
+ggml_tensor * llama_kv_cache::get_qjl_codebook(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return ggml_view_tensor(ctx, layers[ikv].qjl_codebook);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1372,10 +1504,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     ggml_tensor * k = layers[ikv].k;
     ggml_tensor * qjl_r = layers[ikv].qjl_r;
     ggml_tensor * qjl_s = layers[ikv].qjl_s;
-    ggml_tensor * qjl_codebook = layers[ikv].qjl_codebook;
     ggml_tensor * qjl_boundaries = layers[ikv].qjl_boundaries;
-    ggml_tensor * qjl_level_lo = layers[ikv].qjl_level_lo;
-    ggml_tensor * qjl_level_hi = layers[ikv].qjl_level_hi;
     ggml_tensor * k_norm = layers[ikv].k_norm;
     ggml_tensor * k_enorm = layers[ikv].k_enorm;
     ggml_tensor * k_esign = layers[ikv].k_esign;
@@ -1410,7 +1539,8 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     GGML_ASSERT(n_embd_head == (int64_t) hparams.n_embd_head_k);
-    const int64_t qjl_levels = int64_t(1u << qjl_bits);
+    const int64_t packed_bytes_per_head = (int64_t) turboquant_pack_3bit_size((size_t) n_embd_head);
+    const int64_t packed_bytes_gqa = packed_bytes_per_head*n_head;
 
     ggml_tensor * k_cur_heads = ggml_reshape_2d(ctx, k_cur, n_embd_head, n_head*n_tokens);
     ggml_tensor * k_rot = ggml_mul_mat(ctx, qjl_r, k_cur_heads);
@@ -1420,54 +1550,23 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     ggml_tensor * k_norm_rep = ggml_repeat(ctx, k_norm_f32, k_rot);
     ggml_tensor * k_unit = ggml_div(ctx, k_rot, k_norm_rep);
 
-    ggml_tensor * idx_f32 = ggml_scale(ctx, k_unit, 0.0f);
-    for (int64_t i = 0; i < qjl_boundaries->ne[1]; ++i) {
-        ggml_tensor * boundary = ggml_view_1d(ctx, qjl_boundaries, 1, i*qjl_boundaries->nb[1]);
-        ggml_tensor * shifted = ggml_add1(ctx, k_unit, ggml_neg(ctx, boundary));
-        idx_f32 = ggml_add(ctx, idx_f32, ggml_step(ctx, shifted));
-    }
-
-    ggml_tensor * k_hat_f32 = ggml_scale(ctx, idx_f32, 0.0f);
-
-    for (int64_t j = 0; j < qjl_levels; ++j) {
-        ggml_tensor * lo_j = ggml_view_1d(ctx, qjl_level_lo, 1, j*qjl_level_lo->nb[1]);
-        ggml_tensor * hi_j = ggml_view_1d(ctx, qjl_level_hi, 1, j*qjl_level_hi->nb[1]);
-        ggml_tensor * lo_rep = ggml_repeat(ctx, lo_j, idx_f32);
-        ggml_tensor * hi_rep = ggml_repeat(ctx, hi_j, idx_f32);
-        ggml_tensor * ge_lo = ggml_step(ctx, ggml_sub(ctx, idx_f32, lo_rep));
-        ggml_tensor * le_hi = ggml_step(ctx, ggml_sub(ctx, hi_rep, idx_f32));
-        ggml_tensor * mask_j = ggml_mul(ctx, ge_lo, le_hi);
-        ggml_tensor * centroid_j = ggml_view_1d(ctx, qjl_codebook, 1, j*qjl_codebook->nb[1]);
-        ggml_tensor * centroid_rep = ggml_repeat(ctx, centroid_j, idx_f32);
-        ggml_tensor * contrib = ggml_mul(ctx, mask_j, centroid_rep);
-        k_hat_f32 = ggml_add(ctx, k_hat_f32, contrib);
-    }
-
-    ggml_tensor * e_main = ggml_mul(ctx, k_norm_rep, k_hat_f32);
-    ggml_tensor * e = ggml_sub(ctx, k_rot, e_main);
-    ggml_tensor * e_norm_f32 = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, e)));
-    ggml_tensor * se = ggml_mul_mat(ctx, qjl_s, e);
-    ggml_tensor * e_sign_f32 = ggml_sgn(ctx, se);
-
     k_norm_f32 = ggml_reshape_4d(ctx, k_norm_f32, 1, n_head, n_tokens, 1);
-    e_norm_f32 = ggml_reshape_4d(ctx, e_norm_f32, 1, n_head, n_tokens, 1);
-    e_sign_f32 = ggml_reshape_4d(ctx, e_sign_f32, qjl_m, n_head, n_tokens, 1);
-
-    k_hat_f32 = ggml_reshape_2d(ctx, k_hat_f32, n_embd_gqa, n_tokens);
 
     const int64_t n_stream = k->ne[2];
     const int64_t n_stream_norm = k_norm->ne[3];
-    const int64_t n_stream_enorm = k_enorm->ne[3];
-    const int64_t n_stream_esign = k_esign->ne[3];
+    const int64_t n_stream_enorm = k_enorm ? k_enorm->ne[3] : 0;
+    const int64_t n_stream_esign = k_esign ? k_esign->ne[3] : 0;
 
     if (n_stream > 1) {
         const int64_t kv_size = get_size();
 
-        assert(n_embd_gqa == k->ne[0]);
+        assert(packed_bytes_gqa == k->ne[0]);
         assert(kv_size    == k->ne[1]);
 
         // merge the buffer across all streams because the idxs are global
-        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+        k = ggml_reshape_2d(ctx, k, packed_bytes_gqa, kv_size*n_stream);
+    } else {
+        k = ggml_reshape_2d(ctx, k, packed_bytes_gqa, get_size());
     }
 
     if (n_stream_norm > 1) {
@@ -1478,38 +1577,67 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
         k_norm = ggml_reshape_2d(ctx, k_norm, n_head, get_size());
     }
 
-    if (n_stream_enorm > 1) {
+    if (k_enorm && n_stream_enorm > 1) {
         const int64_t kv_size = get_size();
 
         k_enorm = ggml_reshape_2d(ctx, k_enorm, n_head, kv_size*n_stream_enorm);
-    } else {
+    } else if (k_enorm) {
         k_enorm = ggml_reshape_2d(ctx, k_enorm, n_head, get_size());
     }
 
-    if (n_stream_esign > 1) {
+    if (k_esign && n_stream_esign > 1) {
         const int64_t kv_size = get_size();
 
         k_esign = ggml_reshape_2d(ctx, k_esign, qjl_m*n_head, kv_size*n_stream_esign);
-    } else {
+    } else if (k_esign) {
         k_esign = ggml_reshape_2d(ctx, k_esign, qjl_m*n_head, get_size());
     }
 
-    ggml_tensor * k_rows = ggml_cont_2d(ctx, k_hat_f32, n_embd_gqa, n_tokens);
     ggml_tensor * k_norm_rows = ggml_cont_2d(ctx, ggml_reshape_2d(ctx, k_norm_f32, n_head, n_tokens), n_head, n_tokens);
+    ggml_tensor * k_norm_set = ggml_set_rows(ctx, k_norm, k_norm_rows, k_idxs);
+
+    ggml_tensor * k_unit_heads = ggml_reshape_3d(ctx, k_unit, n_embd_head, n_head, n_tokens);
+
+    if (!qjl_corr_enabled) {
+        ggml_tensor * k_args[] = {
+            k_unit_heads,
+            k_idxs,
+            qjl_boundaries,
+            k_norm_set,
+        };
+        return ggml_custom_inplace(ctx, k, k_args, 4, turboquant_custom_pack_qjl_k, GGML_N_TASKS_MAX, nullptr);
+    }
+
+    ggml_tensor * idx_f32 = ggml_scale(ctx, k_unit, 0.0f);
+    for (int64_t i = 0; i < qjl_boundaries->ne[1]; ++i) {
+        ggml_tensor * boundary = ggml_view_1d(ctx, qjl_boundaries, 1, i*qjl_boundaries->nb[1]);
+        ggml_tensor * shifted = ggml_add1(ctx, k_unit, ggml_neg(ctx, boundary));
+        idx_f32 = ggml_add(ctx, idx_f32, ggml_step(ctx, shifted));
+    }
+
+    ggml_tensor * k_hat_f32 = ggml_get_rows(ctx, layers[ikv].qjl_codebook, ggml_cont(ctx, idx_f32));
+    ggml_tensor * e = ggml_sub(ctx, k_unit, k_hat_f32);
+    ggml_tensor * e_norm_f32 = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, e)));
+    ggml_tensor * se = ggml_mul_mat(ctx, qjl_s, e);
+    ggml_tensor * e_sign_f32 = ggml_sgn(ctx, se);
+
+    e_norm_f32 = ggml_reshape_4d(ctx, e_norm_f32, 1, n_head, n_tokens, 1);
+    e_sign_f32 = ggml_reshape_4d(ctx, e_sign_f32, qjl_m, n_head, n_tokens, 1);
+
     ggml_tensor * k_enorm_rows = ggml_cont_2d(ctx, ggml_reshape_2d(ctx, e_norm_f32, n_head, n_tokens), n_head, n_tokens);
     ggml_tensor * k_esign_rows = ggml_cont_2d(ctx, ggml_reshape_2d(ctx, e_sign_f32, qjl_m*n_head, n_tokens), qjl_m*n_head, n_tokens);
-
-    ggml_tensor * k_set = ggml_set_rows(ctx, k, k_rows, k_idxs);
-    ggml_tensor * k_norm_set = ggml_set_rows(ctx, k_norm, k_norm_rows, k_idxs);
     ggml_tensor * k_enorm_set = ggml_set_rows(ctx, k_enorm, k_enorm_rows, k_idxs);
     ggml_tensor * k_esign_set = ggml_set_rows(ctx, k_esign, k_esign_rows, k_idxs);
-    ggml_tensor * k_norm_dep = ggml_sum(ctx, k_norm_set);
-    ggml_tensor * k_enorm_dep = ggml_sum(ctx, k_enorm_set);
-    ggml_tensor * k_esign_dep = ggml_sum(ctx, k_esign_set);
-    ggml_tensor * deps = ggml_add(ctx, k_norm_dep, k_enorm_dep);
-    deps = ggml_add(ctx, deps, k_esign_dep);
 
-    return ggml_add1(ctx, k_set, deps);
+    ggml_tensor * k_args[] = {
+        k_unit_heads,
+        k_idxs,
+        qjl_boundaries,
+        k_norm_set,
+        k_enorm_set,
+        k_esign_set,
+    };
+    return ggml_custom_inplace(ctx, k, k_args, 6, turboquant_custom_pack_qjl_k, GGML_N_TASKS_MAX, nullptr);
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
@@ -2050,12 +2178,14 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     const uint32_t v_trans = this->v_trans ? 1 : 0;
     const uint32_t n_layer = layers.size();
     const uint32_t qjl_state = qjl_enabled ? 1 : 0;
+    const uint32_t qjl_corr_state = qjl_corr_enabled ? 1 : 0;
     const uint32_t qjl_bits_state = qjl_bits;
     const uint32_t qjl_m_state = qjl_m;
 
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
     io.write(&qjl_state, sizeof(qjl_state));
+    io.write(&qjl_corr_state, sizeof(qjl_corr_state));
     io.write(&qjl_bits_state, sizeof(qjl_bits_state));
     io.write(&qjl_m_state, sizeof(qjl_m_state));
 
@@ -2083,50 +2213,16 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                 io.write_tensor(k, range.first * k_size_row, buf_size);
             }
         } else {
-            const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-            const uint64_t k_size_row_packed = turboquant_pack_3bit_size(n_embd_k_gqa);
+            const uint64_t k_size_row_packed = k->nb[1];
             io.write(&k_size_row_packed, sizeof(k_size_row_packed));
-
-            const uint32_t qjl_levels = 1u << qjl_bits;
-
-            std::vector<ggml_fp16_t> k_raw;
-            std::vector<uint8_t> k_packed;
-            std::vector<uint8_t> row_packed;
-            std::vector<float> qjl_codebook_row(qjl_levels);
-            ggml_backend_tensor_get(layer.qjl_codebook, qjl_codebook_row.data(), 0, qjl_codebook_row.size()*sizeof(float));
 
             for (const auto & range : cr.data) {
                 const size_t range_size = range.second - range.first;
-                k_raw.resize(range_size * n_embd_k_gqa);
-                ggml_backend_tensor_get(k, k_raw.data(), range.first * k_size_row, range_size * k_size_row);
-
-                k_packed.resize(range_size * k_size_row_packed);
-                for (size_t row = 0; row < range_size; ++row) {
-                    std::vector<int8_t> row_idx(n_embd_k_gqa);
-                    for (uint32_t i = 0; i < n_embd_k_gqa; ++i) {
-                        const float x = ggml_fp16_to_fp32(k_raw[row*n_embd_k_gqa + i]);
-                        int best = 0;
-                        float best_dist = std::fabs(x - qjl_codebook_row[0]);
-                        for (uint32_t j = 1; j < qjl_levels; ++j) {
-                            const float dist = std::fabs(x - qjl_codebook_row[j]);
-                            if (dist < best_dist) {
-                                best = (int) j;
-                                best_dist = dist;
-                            }
-                        }
-                        row_idx[i] = (int8_t) best;
-                    }
-                    turboquant_pack_3bit(row_idx.data(), n_embd_k_gqa, row_packed);
-                    memcpy(k_packed.data() + row*k_size_row_packed, row_packed.data(), k_size_row_packed);
-                }
-
-                io.write(k_packed.data(), k_packed.size());
+                const size_t buf_size = range_size * k_size_row_packed;
+                io.write_tensor(k, range.first * k_size_row_packed, buf_size);
             }
 
             auto * k_norm = layer.k_norm_stream[cr.strm];
-            auto * k_enorm = layer.k_enorm_stream[cr.strm];
-            auto * k_esign = layer.k_esign_stream[cr.strm];
-
             const int32_t k_norm_type_i = (int32_t) k_norm->type;
             const uint64_t k_norm_size_row = k_norm->nb[2];
             io.write(&k_norm_type_i, sizeof(k_norm_type_i));
@@ -2136,42 +2232,43 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                 io.write_tensor(k_norm, range.first * k_norm_size_row, range_size * k_norm_size_row);
             }
 
-            const int32_t k_enorm_type_i = (int32_t) k_enorm->type;
-            const uint64_t k_enorm_size_row = k_enorm->nb[2];
-            io.write(&k_enorm_type_i, sizeof(k_enorm_type_i));
-            io.write(&k_enorm_size_row, sizeof(k_enorm_size_row));
-            for (const auto & range : cr.data) {
-                const size_t range_size = range.second - range.first;
-                io.write_tensor(k_enorm, range.first * k_enorm_size_row, range_size * k_enorm_size_row);
-            }
+            if (qjl_corr_enabled) {
+                auto * k_enorm = layer.k_enorm_stream[cr.strm];
+                auto * k_esign = layer.k_esign_stream[cr.strm];
 
-            const int32_t k_esign_type_i = (int32_t) k_esign->type;
-            const uint32_t n_esign_el = qjl_m * hparams.n_head_kv(il);
-            const uint64_t k_esign_size_row = k_esign->nb[2];
-            const uint64_t k_esign_size_row_packed = turboquant_pack_1bit_size(n_esign_el);
-            io.write(&k_esign_type_i, sizeof(k_esign_type_i));
-            io.write(&k_esign_size_row_packed, sizeof(k_esign_size_row_packed));
-
-            std::vector<ggml_fp16_t> k_esign_raw;
-            std::vector<uint8_t> k_esign_packed;
-            std::vector<uint8_t> row_sign_packed;
-
-            for (const auto & range : cr.data) {
-                const size_t range_size = range.second - range.first;
-                k_esign_raw.resize(range_size * n_esign_el);
-                ggml_backend_tensor_get(k_esign, k_esign_raw.data(), range.first * k_esign_size_row, range_size * k_esign_size_row);
-
-                k_esign_packed.resize(range_size * k_esign_size_row_packed);
-                for (size_t row = 0; row < range_size; ++row) {
-                    std::vector<int8_t> row_sign(n_esign_el);
-                    for (uint32_t i = 0; i < n_esign_el; ++i) {
-                        row_sign[i] = ggml_fp16_to_fp32(k_esign_raw[row*n_esign_el + i]) > 0.0f ? int8_t(1) : int8_t(-1);
-                    }
-                    turboquant_pack_sign_1bit(row_sign.data(), n_esign_el, row_sign_packed);
-                    memcpy(k_esign_packed.data() + row*k_esign_size_row_packed, row_sign_packed.data(), k_esign_size_row_packed);
+                const int32_t k_enorm_type_i = (int32_t) k_enorm->type;
+                const uint64_t k_enorm_size_row = k_enorm->nb[2];
+                io.write(&k_enorm_type_i, sizeof(k_enorm_type_i));
+                io.write(&k_enorm_size_row, sizeof(k_enorm_size_row));
+                for (const auto & range : cr.data) {
+                    const size_t range_size = range.second - range.first;
+                    io.write_tensor(k_enorm, range.first * k_enorm_size_row, range_size * k_enorm_size_row);
                 }
 
-                io.write(k_esign_packed.data(), k_esign_packed.size());
+                const int32_t k_esign_type_i = (int32_t) k_esign->type;
+                const uint32_t n_esign_el = qjl_m * hparams.n_head_kv(il);
+                const uint64_t k_esign_size_row = k_esign->nb[2];
+                const uint64_t k_esign_size_row_packed = turboquant_pack_1bit_size(n_esign_el);
+                io.write(&k_esign_type_i, sizeof(k_esign_type_i));
+                io.write(&k_esign_size_row_packed, sizeof(k_esign_size_row_packed));
+
+                std::vector<int8_t> k_esign_raw;
+                std::vector<uint8_t> k_esign_packed;
+                std::vector<uint8_t> row_sign_packed;
+
+                for (const auto & range : cr.data) {
+                    const size_t range_size = range.second - range.first;
+                    k_esign_raw.resize(range_size * n_esign_el);
+                    ggml_backend_tensor_get(k_esign, k_esign_raw.data(), range.first * k_esign_size_row, range_size * k_esign_size_row);
+
+                    k_esign_packed.resize(range_size * k_esign_size_row_packed);
+                    for (size_t row = 0; row < range_size; ++row) {
+                        turboquant_pack_sign_1bit(k_esign_raw.data() + row*n_esign_el, n_esign_el, row_sign_packed);
+                        memcpy(k_esign_packed.data() + row*k_esign_size_row_packed, row_sign_packed.data(), k_esign_size_row_packed);
+                    }
+
+                    io.write(k_esign_packed.data(), k_esign_packed.size());
+                }
             }
         }
     }
@@ -2339,12 +2436,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     uint32_t v_trans;
     uint32_t n_layer;
     uint32_t qjl_state;
+    uint32_t qjl_corr_state;
     uint32_t qjl_bits_state;
     uint32_t qjl_m_state;
 
     io.read_to(&v_trans, sizeof(v_trans));
     io.read_to(&n_layer, sizeof(n_layer));
     io.read_to(&qjl_state, sizeof(qjl_state));
+    io.read_to(&qjl_corr_state, sizeof(qjl_corr_state));
     io.read_to(&qjl_bits_state, sizeof(qjl_bits_state));
     io.read_to(&qjl_m_state, sizeof(qjl_m_state));
 
@@ -2363,7 +2462,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         return false;
     }
 
-    if (qjl_state != (uint32_t) (qjl_enabled ? 1 : 0) || qjl_bits_state != qjl_bits || qjl_m_state != qjl_m) {
+    if (qjl_state != (uint32_t) (qjl_enabled ? 1 : 0) ||
+        qjl_corr_state != (uint32_t) (qjl_corr_enabled ? 1 : 0) ||
+        qjl_bits_state != qjl_bits || qjl_m_state != qjl_m) {
         LLAMA_LOG_ERROR("%s: incompatible QJL state encoding\n", __func__);
         return false;
     }
@@ -2401,33 +2502,17 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             uint64_t k_size_row_packed_ref;
             io.read_to(&k_size_row_packed_ref, sizeof(k_size_row_packed_ref));
 
-            const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-            const size_t k_size_row_packed = turboquant_pack_3bit_size(n_embd_k_gqa);
+            const size_t k_size_row_packed = k->nb[1];
             if (k_size_row_packed != k_size_row_packed_ref) {
                 LLAMA_LOG_ERROR("%s: mismatched packed key row size (%zu != %zu, layer %d)\n", __func__, k_size_row_packed, (size_t) k_size_row_packed_ref, il);
                 return false;
             }
 
             if (cell_count) {
-                const uint8_t * packed = io.read(cell_count * k_size_row_packed);
-                const uint32_t qjl_levels = 1u << qjl_bits;
-                std::vector<int8_t> raw_idx(cell_count * n_embd_k_gqa);
-                std::vector<ggml_fp16_t> raw(cell_count * n_embd_k_gqa);
-                std::vector<float> qjl_codebook_row(qjl_levels);
-                ggml_backend_tensor_get(layer.qjl_codebook, qjl_codebook_row.data(), 0, qjl_codebook_row.size()*sizeof(float));
-                for (uint32_t row = 0; row < cell_count; ++row) {
-                    turboquant_unpack_3bit(packed + row*k_size_row_packed, n_embd_k_gqa, raw_idx.data() + row*n_embd_k_gqa);
-                    for (uint32_t i = 0; i < n_embd_k_gqa; ++i) {
-                        raw[row*n_embd_k_gqa + i] = ggml_fp32_to_fp16(qjl_codebook_row[(uint8_t) raw_idx[row*n_embd_k_gqa + i]]);
-                    }
-                }
-                ggml_backend_tensor_set(k, raw.data(), head * k_size_row, cell_count * k_size_row);
+                ggml_backend_tensor_set(k, io.read(cell_count * k_size_row_packed), head * k_size_row_packed, cell_count * k_size_row_packed);
             }
 
             auto * k_norm = layer.k_norm_stream[strm];
-            auto * k_enorm = layer.k_enorm_stream[strm];
-            auto * k_esign = layer.k_esign_stream[strm];
-
             int32_t k_norm_type_i_ref;
             io.read_to(&k_norm_type_i_ref, sizeof(k_norm_type_i_ref));
             if ((int32_t) k_norm->type != k_norm_type_i_ref) {
@@ -2446,52 +2531,53 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
                 ggml_backend_tensor_set(k_norm, io.read(cell_count * k_norm_size_row), head * k_norm_size_row, cell_count * k_norm_size_row);
             }
 
-            int32_t k_enorm_type_i_ref;
-            io.read_to(&k_enorm_type_i_ref, sizeof(k_enorm_type_i_ref));
-            if ((int32_t) k_enorm->type != k_enorm_type_i_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched k_enorm type (%d != %d, layer %d)\n", __func__, (int32_t) k_enorm->type, k_enorm_type_i_ref, il);
-                return false;
-            }
+            if (qjl_corr_enabled) {
+                auto * k_enorm = layer.k_enorm_stream[strm];
+                auto * k_esign = layer.k_esign_stream[strm];
 
-            uint64_t k_enorm_size_row_ref;
-            io.read_to(&k_enorm_size_row_ref, sizeof(k_enorm_size_row_ref));
-            const size_t k_enorm_size_row = k_enorm->nb[2];
-            if (k_enorm_size_row != k_enorm_size_row_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched k_enorm row size (%zu != %zu, layer %d)\n", __func__, k_enorm_size_row, (size_t) k_enorm_size_row_ref, il);
-                return false;
-            }
-            if (cell_count) {
-                ggml_backend_tensor_set(k_enorm, io.read(cell_count * k_enorm_size_row), head * k_enorm_size_row, cell_count * k_enorm_size_row);
-            }
-
-            int32_t k_esign_type_i_ref;
-            io.read_to(&k_esign_type_i_ref, sizeof(k_esign_type_i_ref));
-            if ((int32_t) k_esign->type != k_esign_type_i_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched k_esign type (%d != %d, layer %d)\n", __func__, (int32_t) k_esign->type, k_esign_type_i_ref, il);
-                return false;
-            }
-
-            uint64_t k_esign_size_row_packed_ref;
-            io.read_to(&k_esign_size_row_packed_ref, sizeof(k_esign_size_row_packed_ref));
-            const uint32_t n_esign_el = qjl_m * hparams.n_head_kv(il);
-            const size_t k_esign_size_row = k_esign->nb[2];
-            const size_t k_esign_size_row_packed = turboquant_pack_1bit_size(n_esign_el);
-            if (k_esign_size_row_packed != k_esign_size_row_packed_ref) {
-                LLAMA_LOG_ERROR("%s: mismatched packed k_esign row size (%zu != %zu, layer %d)\n", __func__, k_esign_size_row_packed, (size_t) k_esign_size_row_packed_ref, il);
-                return false;
-            }
-
-            if (cell_count) {
-                const uint8_t * packed = io.read(cell_count * k_esign_size_row_packed);
-                std::vector<int8_t> raw_sign(cell_count * n_esign_el);
-                std::vector<ggml_fp16_t> raw(cell_count * n_esign_el);
-                for (uint32_t row = 0; row < cell_count; ++row) {
-                    turboquant_unpack_sign_1bit(packed + row*k_esign_size_row_packed, n_esign_el, raw_sign.data() + row*n_esign_el);
-                    for (uint32_t i = 0; i < n_esign_el; ++i) {
-                        raw[row*n_esign_el + i] = ggml_fp32_to_fp16(raw_sign[row*n_esign_el + i] > 0 ? 1.0f : -1.0f);
-                    }
+                int32_t k_enorm_type_i_ref;
+                io.read_to(&k_enorm_type_i_ref, sizeof(k_enorm_type_i_ref));
+                if ((int32_t) k_enorm->type != k_enorm_type_i_ref) {
+                    LLAMA_LOG_ERROR("%s: mismatched k_enorm type (%d != %d, layer %d)\n", __func__, (int32_t) k_enorm->type, k_enorm_type_i_ref, il);
+                    return false;
                 }
-                ggml_backend_tensor_set(k_esign, raw.data(), head * k_esign_size_row, cell_count * k_esign_size_row);
+
+                uint64_t k_enorm_size_row_ref;
+                io.read_to(&k_enorm_size_row_ref, sizeof(k_enorm_size_row_ref));
+                const size_t k_enorm_size_row = k_enorm->nb[2];
+                if (k_enorm_size_row != k_enorm_size_row_ref) {
+                    LLAMA_LOG_ERROR("%s: mismatched k_enorm row size (%zu != %zu, layer %d)\n", __func__, k_enorm_size_row, (size_t) k_enorm_size_row_ref, il);
+                    return false;
+                }
+                if (cell_count) {
+                    ggml_backend_tensor_set(k_enorm, io.read(cell_count * k_enorm_size_row), head * k_enorm_size_row, cell_count * k_enorm_size_row);
+                }
+
+                int32_t k_esign_type_i_ref;
+                io.read_to(&k_esign_type_i_ref, sizeof(k_esign_type_i_ref));
+                if ((int32_t) k_esign->type != k_esign_type_i_ref) {
+                    LLAMA_LOG_ERROR("%s: mismatched k_esign type (%d != %d, layer %d)\n", __func__, (int32_t) k_esign->type, k_esign_type_i_ref, il);
+                    return false;
+                }
+
+                uint64_t k_esign_size_row_packed_ref;
+                io.read_to(&k_esign_size_row_packed_ref, sizeof(k_esign_size_row_packed_ref));
+                const uint32_t n_esign_el = qjl_m * hparams.n_head_kv(il);
+                const size_t k_esign_size_row = k_esign->nb[2];
+                const size_t k_esign_size_row_packed = turboquant_pack_1bit_size(n_esign_el);
+                if (k_esign_size_row_packed != k_esign_size_row_packed_ref) {
+                    LLAMA_LOG_ERROR("%s: mismatched packed k_esign row size (%zu != %zu, layer %d)\n", __func__, k_esign_size_row_packed, (size_t) k_esign_size_row_packed_ref, il);
+                    return false;
+                }
+
+                if (cell_count) {
+                    const uint8_t * packed = io.read(cell_count * k_esign_size_row_packed);
+                    std::vector<int8_t> raw_sign(cell_count * n_esign_el);
+                    for (uint32_t row = 0; row < cell_count; ++row) {
+                        turboquant_unpack_sign_1bit(packed + row*k_esign_size_row_packed, n_esign_el, raw_sign.data() + row*n_esign_el);
+                    }
+                    ggml_backend_tensor_set(k_esign, raw_sign.data(), head * k_esign_size_row, cell_count * k_esign_size_row);
+                }
             }
         }
     }
@@ -2678,6 +2764,10 @@ ggml_tensor * llama_kv_cache_context::get_qjl_r(ggml_context * ctx, int32_t il) 
 
 ggml_tensor * llama_kv_cache_context::get_qjl_s(ggml_context * ctx, int32_t il) const {
     return kv->get_qjl_s(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_qjl_codebook(ggml_context * ctx, int32_t il) const {
+    return kv->get_qjl_codebook(ctx, il);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {

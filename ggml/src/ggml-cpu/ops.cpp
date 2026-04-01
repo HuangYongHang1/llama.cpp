@@ -5183,7 +5183,15 @@ static void ggml_compute_forward_get_rows_q(
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
-        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+        const char * idx_ptr = (char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12;
+        int64_t i01;
+        if (src1->type == GGML_TYPE_I8) {
+            i01 = *(const int8_t *) idx_ptr;
+        } else if (src1->type == GGML_TYPE_F16) {
+            i01 = (int64_t) llroundf(GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) idx_ptr));
+        } else {
+            i01 = *(const int32_t *) idx_ptr;
+        }
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
@@ -5224,7 +5232,15 @@ static void ggml_compute_forward_get_rows_f16(
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
-        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+        const char * idx_ptr = (char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12;
+        int64_t i01;
+        if (src1->type == GGML_TYPE_I8) {
+            i01 = *(const int8_t *) idx_ptr;
+        } else if (src1->type == GGML_TYPE_F16) {
+            i01 = (int64_t) llroundf(GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) idx_ptr));
+        } else {
+            i01 = *(const int32_t *) idx_ptr;
+        }
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
@@ -5265,7 +5281,15 @@ static void ggml_compute_forward_get_rows_bf16(
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
-        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+        const char * idx_ptr = (char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12;
+        int64_t i01;
+        if (src1->type == GGML_TYPE_I8) {
+            i01 = *(const int8_t *) idx_ptr;
+        } else if (src1->type == GGML_TYPE_F16) {
+            i01 = (int64_t) llroundf(GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) idx_ptr));
+        } else {
+            i01 = *(const int32_t *) idx_ptr;
+        }
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
@@ -5306,7 +5330,15 @@ static void ggml_compute_forward_get_rows_f32(
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
-        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+        const char * idx_ptr = (char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12;
+        int64_t i01;
+        if (src1->type == GGML_TYPE_I8) {
+            i01 = *(const int8_t *) idx_ptr;
+        } else if (src1->type == GGML_TYPE_F16) {
+            i01 = (int64_t) llroundf(GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) idx_ptr));
+        } else {
+            i01 = *(const int32_t *) idx_ptr;
+        }
 
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 

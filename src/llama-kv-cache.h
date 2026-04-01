@@ -149,6 +149,7 @@ public:
     ggml_tensor * get_k_esign(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_qjl_r(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_qjl_s(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_qjl_codebook(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
@@ -231,6 +232,7 @@ private:
 
     // TurboQuant prototype parameters.
     const bool qjl_enabled = false;
+    bool qjl_corr_enabled = false;
     const uint32_t qjl_bits = 3;
     const uint32_t qjl_m = 64;
 
@@ -344,6 +346,7 @@ public:
     ggml_tensor * get_k_esign(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_qjl_r(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_qjl_s(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_qjl_codebook(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location

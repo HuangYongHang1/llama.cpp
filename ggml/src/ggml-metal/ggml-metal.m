@@ -4313,6 +4313,7 @@ static int ggml_metal_encode_node(
                     /*.nb11 =*/ nb11,
                     /*.nb1 =*/ nb1,
                     /*.nb2 =*/ nb2,
+                    /*.src1_type =*/ src1->type,
                 };
 
                 [encoder setComputePipelineState:pipeline];
